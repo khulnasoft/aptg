@@ -1,0 +1,12 @@
+target/
+**/*.rs.bk
+.git/
+.gitignore
+.github/
+Dockerfile
+docker-compose.yml
+build.log
+*.mmdb
+certs/*.pem
+certs/*.key
+keyring/*.gpg

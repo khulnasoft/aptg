@@ -1,0 +1,49 @@
+# aptg Configuration
+
+[server]
+host = "0.0.0.0"
+port = 8080
+https_port = 8443
+enable_https = true
+
+[tls]
+# Server certificate and key
+cert_path = "certs/server.pem"
+key_path = "certs/server.key"
+ca_path = "certs/ca.pem"
+client_auth_required = false
+min_tls_version = "1.2"
+
+[upstream]
+base_url = "https://deb.debian.org"
+timeout_seconds = 30
+verify_ssl = true
+ca_cert_path = "certs/upstream-ca.pem"
+
+[cache]
+# TTL values in seconds
+release_ttl = 21600    # 6 hours
+packages_ttl = 43200   # 12 hours  
+deb_ttl = 31536000     # 1 year (effectively forever)
+
+[policy.allow]
+suites = ["bookworm", "bullseye"]
+components = ["main", "contrib", "non-free"]
+architectures = ["amd64", "arm64"]
+
+[policy.deny]
+architectures = ["i386"]
+packages = []
+
+[policy.limits]
+max_deb_size_mb = 500
+max_request_rate_per_minute = 100
+
+[audit]
+log_level = "info"
+log_file = "/var/log/aptg.log"
+
+[verification]
+gpg_keyring_path = "/etc/debian-archive-keyring.gpg"
+enable_gpg_verification = true
+enable_hash_verification = true

@@ -1,0 +1,43 @@
+[package]
+name = "aptg"
+version = "0.1.0"
+edition = "2021"
+authors = ["Security Team"]
+description = "Secure Debian mirror redirector with verification and caching"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+warp = { version = "0.3", features = ["tls"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"
+thiserror = "1.0"
+sha2 = "0.10"
+hex = "0.4"
+bytes = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+openssl = "0.10"
+rustls = "0.21"
+tokio-rustls = "0.24"
+rustls-pemfile = "1.0"
+x509-parser = "0.15"
+rustls-native-certs = "0.6"
+webpki-roots = "0.25"
+maxminddb = "0.24.0"
+geoip2 = "0.1.5"
+
+[dependencies.gpgme]
+version = "0.11"
+optional = true
+
+[dev-dependencies]
+tempfile = "3.2"
+
+[features]
+default = []
+gpg-verify = ["gpgme"]

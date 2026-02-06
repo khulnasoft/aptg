@@ -1,0 +1,27 @@
+[project]
+name = "aptg"
+version = "0.1.0"
+languages = ["rust"]
+
+[build]
+command = "cargo build"
+test_command = "cargo test"
+
+[deploy]
+command = "docker-compose up -d"
+
+[docs]
+path = "README.md"
+contributing = "CONTRIBUTING.md"
+security = "SECURITY.md"
+coc = "CODE_OF_CONDUCT.md"
+license = ["LICENSE-MIT", "LICENSE-APACHE"]
+
+[ci]
+provider = "github-actions"
+workflow = ".github/workflows/ci.yml"
+
+[docker]
+file = "Dockerfile"
+compose = "docker-compose.yml"
+ignore = ".dockerignore"

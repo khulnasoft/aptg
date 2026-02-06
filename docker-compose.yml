@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  aptg:
+    build: .
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    volumes:
+      - ./config.toml:/app/config.toml
+      - ./certs:/app/certs
+      - ./keyring:/app/keyring
+      - ./GeoLite2-City.mmdb:/app/GeoLite2-City.mmdb
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
