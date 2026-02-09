@@ -28,7 +28,7 @@ rustls-pemfile = "1.0"
 x509-parser = "0.15"
 rustls-native-certs = "0.6"
 webpki-roots = "0.25"
-maxminddb = "0.24.0"
+maxminddb = "0.27.0"
 geoip2 = "0.1.5"
 
 [dependencies.gpgme]
