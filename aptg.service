@@ -1,0 +1,36 @@
+[Unit]
+Description=aptg Debian Mirror Redirector
+Documentation=https://github.com/khulnasoft/aptg
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aptg
+Group=aptg
+WorkingDirectory=/var/lib/aptg
+EnvironmentFile=-/etc/default/aptg
+ExecStart=/usr/local/bin/aptg --config /etc/aptg/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadOnlyDirectories=/
+ReadWriteDirectories=/var/lib/aptg /var/log/aptg /etc/aptg
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
