@@ -1,11 +1,10 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
-
-use tracing::{info, warn, error};
 use crate::geoip::database::GeoIpDatabase;
 use crate::geoip::location::LocationInfo;
 use std::fmt;
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoPolicy {
@@ -28,19 +27,50 @@ pub struct GeoRule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum GeoCondition {
-    CountryCode { codes: Vec<String> },
-    Continent { codes: Vec<String> },
-    Region { regions: Vec<String> },
-    City { cities: Vec<String> },
-    CountryGroup { groups: Vec<String> },
-    RiskScore { min: Option<u8>, max: Option<u8> },
-    Distance { latitude: f64, longitude: f64, radius_km: f64 },
-    Timezone { zones: Vec<String> },
-    BusinessHours { enabled: bool },
-    AnonymousProxy { blocked: bool },
-    SatelliteProvider { blocked: bool },
-    Asn { ranges: Vec<AsnRange> },
-    Custom { field: String, operator: String, value: String },
+    CountryCode {
+        codes: Vec<String>,
+    },
+    Continent {
+        codes: Vec<String>,
+    },
+    Region {
+        regions: Vec<String>,
+    },
+    City {
+        cities: Vec<String>,
+    },
+    CountryGroup {
+        groups: Vec<String>,
+    },
+    RiskScore {
+        min: Option<u8>,
+        max: Option<u8>,
+    },
+    Distance {
+        latitude: f64,
+        longitude: f64,
+        radius_km: f64,
+    },
+    Timezone {
+        zones: Vec<String>,
+    },
+    BusinessHours {
+        enabled: bool,
+    },
+    AnonymousProxy {
+        blocked: bool,
+    },
+    SatelliteProvider {
+        blocked: bool,
+    },
+    Asn {
+        ranges: Vec<AsnRange>,
+    },
+    Custom {
+        field: String,
+        operator: String,
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,7 +88,9 @@ impl fmt::Display for GeoAction {
         match self {
             GeoAction::Allow => write!(f, "Allow"),
             GeoAction::Deny => write!(f, "Deny"),
-            GeoAction::RateLimit { requests_per_minute } => write!(f, "RateLimit({} req/min)", requests_per_minute),
+            GeoAction::RateLimit {
+                requests_per_minute,
+            } => write!(f, "RateLimit({} req/min)", requests_per_minute),
             GeoAction::LogOnly => write!(f, "LogOnly"),
             GeoAction::Redirect { url } => write!(f, "Redirect({})", url),
         }
@@ -99,10 +131,7 @@ impl GeoPolicyEngine {
             None
         };
 
-        Self {
-            database,
-            policy,
-        }
+        Self { database, policy }
     }
 
     pub fn check_request(&self, ip_address: &str, _path: &str) -> Result<PolicyResult> {
@@ -115,10 +144,13 @@ impl GeoPolicyEngine {
             });
         }
 
-        let database = self.database.as_ref()
+        let database = self
+            .database
+            .as_ref()
             .ok_or_else(|| anyhow!("GeoIP database not available"))?;
 
-        let location = database.lookup(ip_address)?
+        let location = database
+            .lookup(ip_address)?
             .unwrap_or_else(|| LocationInfo::new(ip_address, "Unknown", "Unknown"));
 
         // Check rules in priority order
@@ -139,12 +171,23 @@ impl GeoPolicyEngine {
         }
 
         let (action, rule_name, reason) = if let Some(rule) = matching_rule {
-            (rule.action.clone(), Some(rule.name.clone()), format!("Matched rule: {}", rule.name))
+            (
+                rule.action.clone(),
+                Some(rule.name.clone()),
+                format!("Matched rule: {}", rule.name),
+            )
         } else {
-            (self.policy.default_action.clone(), None, "No matching rule".to_string())
+            (
+                self.policy.default_action.clone(),
+                None,
+                "No matching rule".to_string(),
+            )
         };
 
-        info!("GeoIP policy check for {}: {} - {}", ip_address, action, reason);
+        info!(
+            "GeoIP policy check for {}: {} - {}",
+            ip_address, action, reason
+        );
 
         Ok(PolicyResult {
             action,
@@ -156,22 +199,22 @@ impl GeoPolicyEngine {
 
     fn evaluate_condition(&self, condition: &GeoCondition, location: &LocationInfo) -> bool {
         match condition {
-            GeoCondition::CountryCode { codes } => {
-                codes.contains(&location.country_code)
-            }
-            GeoCondition::Continent { codes } => {
-                codes.contains(&location.continent_code)
-            }
+            GeoCondition::CountryCode { codes } => codes.contains(&location.country_code),
+            GeoCondition::Continent { codes } => codes.contains(&location.continent_code),
             GeoCondition::Region { regions } => {
                 if let Some(ref region) = location.region {
-                    regions.iter().any(|r| r.to_lowercase() == region.to_lowercase())
+                    regions
+                        .iter()
+                        .any(|r| r.to_lowercase() == region.to_lowercase())
                 } else {
                     false
                 }
             }
             GeoCondition::City { cities } => {
                 if let Some(ref city) = location.city {
-                    cities.iter().any(|c| c.to_lowercase() == city.to_lowercase())
+                    cities
+                        .iter()
+                        .any(|c| c.to_lowercase() == city.to_lowercase())
                 } else {
                     false
                 }
@@ -183,9 +226,11 @@ impl GeoPolicyEngine {
                 let score = location.get_risk_score();
                 min.map_or(true, |m| score >= m) && max.map_or(true, |m| score <= m)
             }
-            GeoCondition::Distance { latitude, longitude, radius_km } => {
-                location.get_distance_from(*latitude, *longitude) <= *radius_km
-            }
+            GeoCondition::Distance {
+                latitude,
+                longitude,
+                radius_km,
+            } => location.get_distance_from(*latitude, *longitude) <= *radius_km,
             GeoCondition::Timezone { zones } => {
                 if let Some(ref timezone) = location.timezone {
                     zones.contains(timezone)
@@ -193,29 +238,35 @@ impl GeoPolicyEngine {
                     false
                 }
             }
-            GeoCondition::BusinessHours { enabled } => {
-                *enabled == location.is_business_hours()
-            }
-            GeoCondition::AnonymousProxy { blocked } => {
-                *blocked == location.is_anonymous_proxy
-            }
+            GeoCondition::BusinessHours { enabled } => *enabled == location.is_business_hours(),
+            GeoCondition::AnonymousProxy { blocked } => *blocked == location.is_anonymous_proxy,
             GeoCondition::SatelliteProvider { blocked } => {
                 *blocked == location.is_satellite_provider
             }
             GeoCondition::Asn { ranges } => {
                 if let Some(asn) = location.asn {
-                    ranges.iter().any(|range| asn >= range.start && asn <= range.end)
+                    ranges
+                        .iter()
+                        .any(|range| asn >= range.start && asn <= range.end)
                 } else {
                     false
                 }
             }
-            GeoCondition::Custom { field, operator, value } => {
-                self.evaluate_custom_field(field, operator, value, location)
-            }
+            GeoCondition::Custom {
+                field,
+                operator,
+                value,
+            } => self.evaluate_custom_field(field, operator, value, location),
         }
     }
 
-    fn evaluate_custom_field(&self, field: &str, operator: &str, value: &str, location: &LocationInfo) -> bool {
+    fn evaluate_custom_field(
+        &self,
+        field: &str,
+        operator: &str,
+        value: &str,
+        location: &LocationInfo,
+    ) -> bool {
         let field_value = match field {
             "country_code" => location.country_code.clone(),
             "country_name" => location.country_name.clone(),
@@ -235,10 +286,22 @@ impl GeoPolicyEngine {
             "contains" => field_value.contains(value),
             "starts_with" => field_value.starts_with(value),
             "ends_with" => field_value.ends_with(value),
-            "gt" => field_value.parse::<f64>().map(|v| v > value.parse().unwrap_or(0.0)).unwrap_or(false),
-            "lt" => field_value.parse::<f64>().map(|v| v < value.parse().unwrap_or(0.0)).unwrap_or(false),
-            "ge" => field_value.parse::<f64>().map(|v| v >= value.parse().unwrap_or(0.0)).unwrap_or(false),
-            "le" => field_value.parse::<f64>().map(|v| v <= value.parse().unwrap_or(0.0)).unwrap_or(false),
+            "gt" => field_value
+                .parse::<f64>()
+                .map(|v| v > value.parse().unwrap_or(0.0))
+                .unwrap_or(false),
+            "lt" => field_value
+                .parse::<f64>()
+                .map(|v| v < value.parse().unwrap_or(0.0))
+                .unwrap_or(false),
+            "ge" => field_value
+                .parse::<f64>()
+                .map(|v| v >= value.parse().unwrap_or(0.0))
+                .unwrap_or(false),
+            "le" => field_value
+                .parse::<f64>()
+                .map(|v| v <= value.parse().unwrap_or(0.0))
+                .unwrap_or(false),
             _ => false,
         }
     }
@@ -294,15 +357,22 @@ impl Default for GeoPolicy {
             rules: vec![
                 GeoRule {
                     name: "Block high-risk countries".to_string(),
-                    condition: GeoCondition::RiskScore { min: Some(80), max: None },
+                    condition: GeoCondition::RiskScore {
+                        min: Some(80),
+                        max: None,
+                    },
                     action: GeoAction::Deny,
                     priority: 100,
                     enabled: true,
                 },
                 GeoRule {
                     name: "Rate limit suspicious regions".to_string(),
-                    condition: GeoCondition::CountryGroup { groups: vec!["high_risk".to_string()] },
-                    action: GeoAction::RateLimit { requests_per_minute: 10 },
+                    condition: GeoCondition::CountryGroup {
+                        groups: vec!["high_risk".to_string()],
+                    },
+                    action: GeoAction::RateLimit {
+                        requests_per_minute: 10,
+                    },
                     priority: 90,
                     enabled: true,
                 },

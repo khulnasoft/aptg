@@ -5,24 +5,24 @@ use tracing_subscriber;
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    
+
     println!("🌍 GeoIP Database Manager");
     println!();
-    
+
     // Create geoip directory if it doesn't exist
     fs::create_dir_all("geoip")?;
-    
+
     println!("📥 Setting up GeoIP database...");
     println!("🔧 Note: In a production environment, you would:");
     println!("   1. Download GeoLite2-City.mmdb from MaxMind");
     println!("   2. Place it in the geoip/ directory");
     println!("   3. Configure the mirror redirector to use it");
     println!();
-    
+
     // Create a placeholder database file for demonstration
     let database_path = "geoip/GeoLite2-City.mmdb";
     fs::write(database_path, "# GeoLite2-City Database Placeholder\n# This would contain actual MaxMind database data in production\n")?;
-    
+
     println!("✅ GeoIP database setup completed!");
     println!("📝 Database location: {}", database_path);
     println!("🔧 Update your config.toml to use this database:");
@@ -43,6 +43,6 @@ async fn main() -> Result<()> {
     println!("   - Rate limit requests from specific regions");
     println!("   - Redirect users to nearest mirror");
     println!("   - Log-only mode for monitoring");
-    
+
     Ok(())
 }

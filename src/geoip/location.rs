@@ -1,9 +1,6 @@
-use anyhow::Result;
-use chrono::{DateTime, Utc, Timelike};
+use chrono::{Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocationInfo {
@@ -81,7 +78,9 @@ impl LocationInfo {
     }
 
     pub fn is_in_region(&self, region: &str) -> bool {
-        self.region.as_ref().map_or(false, |r| r.to_lowercase() == region.to_lowercase())
+        self.region
+            .as_ref()
+            .map_or(false, |r| r.to_lowercase() == region.to_lowercase())
     }
 
     pub fn is_in_continent(&self, continent_code: &str) -> bool {
@@ -95,17 +94,17 @@ impl LocationInfo {
     pub fn get_distance_from(&self, other_lat: f64, other_lon: f64) -> f64 {
         // Calculate distance using Haversine formula
         const EARTH_RADIUS_KM: f64 = 6371.0;
-        
+
         let lat1_rad = self.latitude.to_radians();
         let lat2_rad = other_lat.to_radians();
         let delta_lat = lat2_rad - lat1_rad;
         let delta_lon = (other_lon - self.longitude).to_radians();
-        
-        let a = (delta_lat / 2.0).sin().powi(2) +
-            lat1_rad.cos() * lat2_rad.cos() * (delta_lon / 2.0).sin().powi(2);
-        
+
+        let a = (delta_lat / 2.0).sin().powi(2)
+            + lat1_rad.cos() * lat2_rad.cos() * (delta_lon / 2.0).sin().powi(2);
+
         let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-        
+
         EARTH_RADIUS_KM * c
     }
 
@@ -156,15 +155,22 @@ impl LocationInfo {
             // North America
             "US" | "CA" | "MX" => "north_america".to_string(),
             // Europe
-            "GB" | "DE" | "FR" | "IT" | "ES" | "NL" | "BE" | "AT" | "CH" | "SE" | "NO" | "DK" | "FI" | "PL" | "CZ" | "HU" | "GR" | "PT" | "IE" => "europe".to_string(),
+            "GB" | "DE" | "FR" | "IT" | "ES" | "NL" | "BE" | "AT" | "CH" | "SE" | "NO" | "DK"
+            | "FI" | "PL" | "CZ" | "HU" | "GR" | "PT" | "IE" => "europe".to_string(),
             // Asia Pacific
-            "CN" | "JP" | "KR" | "SG" | "AU" | "NZ" | "IN" | "TH" | "MY" | "ID" | "PH" => "asia_pacific".to_string(),
+            "CN" | "JP" | "KR" | "SG" | "AU" | "NZ" | "IN" | "TH" | "MY" | "ID" | "PH" => {
+                "asia_pacific".to_string()
+            }
             // South America
-            "BR" | "AR" | "CL" | "CO" | "PE" | "VE" | "EC" | "BO" | "UY" | "PY" => "south_america".to_string(),
+            "BR" | "AR" | "CL" | "CO" | "PE" | "VE" | "EC" | "BO" | "UY" | "PY" => {
+                "south_america".to_string()
+            }
             // Africa
             "ZA" | "EG" | "NG" | "KE" | "MA" | "TN" | "GH" => "africa".to_string(),
             // Middle East
-            "SA" | "AE" | "IL" | "IR" | "IQ" | "JO" | "LB" | "SY" | "TR" => "middle_east".to_string(),
+            "SA" | "AE" | "IL" | "IR" | "IQ" | "JO" | "LB" | "SY" | "TR" => {
+                "middle_east".to_string()
+            }
             // Others
             _ => "other".to_string(),
         }
@@ -173,7 +179,7 @@ impl LocationInfo {
     pub fn get_risk_score(&self) -> u8 {
         // Simple risk scoring based on location
         let mut score = 50; // Base score
-        
+
         // Adjust based on country
         match self.country_code.as_str() {
             // High risk countries
@@ -184,17 +190,17 @@ impl LocationInfo {
             "US" | "CA" | "GB" | "DE" | "FR" | "JP" | "AU" => score -= 10,
             _ => {}
         }
-        
+
         // Adjust based on anonymity
         if self.is_anonymous_proxy {
             score += 40;
         }
-        
+
         // Adjust based on satellite provider
         if self.is_satellite_provider {
             score += 20;
         }
-        
+
         // Cap at 100
         score.min(100)
     }
@@ -202,12 +208,12 @@ impl LocationInfo {
     pub fn get_location_hash(&self) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
+
         let mut hasher = DefaultHasher::new();
         self.country_code.hash(&mut hasher);
         self.city.hash(&mut hasher);
         self.region.hash(&mut hasher);
-        
+
         format!("{:x}", hasher.finish())
     }
 }
@@ -234,15 +240,21 @@ impl LocationStats {
 
     pub fn record_request(&mut self, location: &LocationInfo) {
         self.total_requests += 1;
-        
-        *self.country_counts.entry(location.country_code.clone()).or_insert(0) += 1;
-        
+
+        *self
+            .country_counts
+            .entry(location.country_code.clone())
+            .or_insert(0) += 1;
+
         if let Some(ref city) = location.city {
             *self.city_counts.entry(city.clone()).or_insert(0) += 1;
         }
-        
-        *self.continent_counts.entry(location.continent_code.clone()).or_insert(0) += 1;
-        
+
+        *self
+            .continent_counts
+            .entry(location.continent_code.clone())
+            .or_insert(0) += 1;
+
         self.last_updated = chrono::Utc::now();
     }
 
@@ -277,10 +289,10 @@ mod tests {
     fn test_country_grouping() {
         let us_location = LocationInfo::new("8.8.8.8", "US", "United States");
         assert_eq!(us_location.get_country_grouping(), "north_america");
-        
+
         let de_location = LocationInfo::new("8.8.8.8", "DE", "Germany");
         assert_eq!(de_location.get_country_grouping(), "europe");
-        
+
         let cn_location = LocationInfo::new("8.8.8.8", "CN", "China");
         assert_eq!(cn_location.get_country_grouping(), "asia_pacific");
     }
@@ -289,12 +301,12 @@ mod tests {
     fn test_risk_score() {
         let safe_location = LocationInfo::new("8.8.8.8", "US", "United States");
         assert_eq!(safe_location.get_risk_score(), 40);
-        
+
         let risky_location = LocationInfo::new("8.8.8.8", "CN", "China");
         assert_eq!(risky_location.get_risk_score(), 80);
-        
-        let proxy_location = LocationInfo::new("8.8.8.8", "US", "United States")
-            .with_anonymous_proxy(true);
+
+        let proxy_location =
+            LocationInfo::new("8.8.8.8", "US", "United States").with_anonymous_proxy(true);
         assert_eq!(proxy_location.get_risk_score(), 80);
     }
 }

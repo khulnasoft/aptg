@@ -24,7 +24,6 @@ dependencies = [
  "anyhow",
  "bytes",
  "chrono",
- "geoip2",
  "gpgme",
  "hex",
  "maxminddb",
@@ -411,26 +410,6 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
-]
-
-[[package]]
-name = "geoip2"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6514903b5164a5d655fcd0cb1d87de8ee7a8de0da4d95b78b8d08de4df7bb6f6"
-dependencies = [
- "geoip2-codegen",
-]
-
-[[package]]
-name = "geoip2-codegen"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f2cac58ebe4e3057db62922453a19143a41aa66e7e5207a06cb07b975c5694b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.114",
 ]
 
 [[package]]

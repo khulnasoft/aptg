@@ -1,9 +1,9 @@
-use anyhow::{Result, anyhow};
-use std::sync::Arc;
+use anyhow::{anyhow, Result};
+use rustls::{Certificate, PrivateKey, ServerConfig};
+use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::fs::File;
 use std::io::BufReader;
-use rustls::{ServerConfig, Certificate, PrivateKey};
-use rustls_pemfile::{certs, pkcs8_private_keys};
+use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use tracing::info;
 
@@ -36,7 +36,7 @@ impl TlsServer {
     pub fn new(config: TlsServerConfig) -> Result<Self> {
         let server_config = Self::build_server_config(&config)?;
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
-        
+
         Ok(Self {
             config: Arc::new(config),
             acceptor,
@@ -45,39 +45,44 @@ impl TlsServer {
 
     fn build_server_config(config: &TlsServerConfig) -> Result<ServerConfig> {
         info!("Building TLS server configuration");
-        
+
         // Load certificate
-        let cert_file = File::open(&config.cert_path)
-            .map_err(|e| anyhow!("Failed to open certificate file {}: {}", config.cert_path, e))?;
+        let cert_file = File::open(&config.cert_path).map_err(|e| {
+            anyhow!(
+                "Failed to open certificate file {}: {}",
+                config.cert_path,
+                e
+            )
+        })?;
         let mut cert_reader = BufReader::new(cert_file);
         let cert_chain: Vec<Certificate> = certs(&mut cert_reader)?
             .into_iter()
             .map(Certificate)
             .collect();
-        
+
         if cert_chain.is_empty() {
             return Err(anyhow!("No certificates found in {}", config.cert_path));
         }
-        
+
         // Load private key
         let key_file = File::open(&config.key_path)
             .map_err(|e| anyhow!("Failed to open private key file {}: {}", config.key_path, e))?;
         let mut key_reader = BufReader::new(key_file);
         let mut keys = pkcs8_private_keys(&mut key_reader)?;
-        
+
         if keys.is_empty() {
             return Err(anyhow!("No private keys found in {}", config.key_path));
         }
-        
+
         let private_key = PrivateKey(keys.remove(0));
-        
+
         // Build server config
         let server_config = ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(cert_chain, private_key)
             .map_err(|e| anyhow!("Failed to build server config: {}", e))?;
-        
+
         info!("TLS server configuration built successfully");
         Ok(server_config)
     }

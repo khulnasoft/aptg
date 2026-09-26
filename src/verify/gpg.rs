@@ -1,8 +1,8 @@
-use anyhow::{Result, anyhow};
-use std::process::Command;
-use std::fs;
-use tracing::{info, warn};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::process::Command;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpgKeyInfo {
@@ -36,11 +36,11 @@ impl GpgVerifier {
 
     pub fn verify_inrelease(&self, inrelease_data: &[u8]) -> Result<GpgVerificationResult> {
         info!("Verifying InRelease file with GPG");
-        
+
         // Write to temporary file
         let temp_path = "/tmp/inrelease_temp";
         fs::write(temp_path, inrelease_data)?;
-        
+
         let output = Command::new("gpg")
             .arg("--verify")
             .arg("--verbose")
@@ -48,23 +48,27 @@ impl GpgVerifier {
             .arg(&self.keyring_path)
             .arg(temp_path)
             .output()?;
-        
+
         // Clean up temp file
         let _ = fs::remove_file(temp_path);
-        
+
         self.parse_gpg_output(&output)
     }
 
-    pub fn verify_release_with_sig(&self, release_data: &[u8], signature_data: &[u8]) -> Result<GpgVerificationResult> {
+    pub fn verify_release_with_sig(
+        &self,
+        release_data: &[u8],
+        signature_data: &[u8],
+    ) -> Result<GpgVerificationResult> {
         info!("Verifying Release file with detached signature");
-        
+
         // Write to temporary files
         let release_path = "/tmp/release_temp";
         let sig_path = "/tmp/release_sig_temp";
-        
+
         fs::write(release_path, release_data)?;
         fs::write(sig_path, signature_data)?;
-        
+
         let output = Command::new("gpg")
             .arg("--verify")
             .arg("--verbose")
@@ -73,34 +77,34 @@ impl GpgVerifier {
             .arg(sig_path)
             .arg(release_path)
             .output()?;
-        
+
         // Clean up temp files
         let _ = fs::remove_file(release_path);
         let _ = fs::remove_file(sig_path);
-        
+
         self.parse_gpg_output(&output)
     }
 
     pub fn list_keys(&self) -> Result<Vec<GpgKeyInfo>> {
         info!("Listing GPG keys in keyring");
-        
+
         let output = Command::new("gpg")
             .arg("--list-keys")
             .arg("--with-colons")
             .arg("--keyring")
             .arg(&self.keyring_path)
             .output()?;
-        
+
         self.parse_key_list(&output)
     }
 
     pub fn import_key(&self, key_data: &[u8]) -> Result<String> {
         info!("Importing GPG key into keyring");
-        
+
         // Write to temporary file
         let temp_path = "/tmp/key_temp.asc";
         fs::write(temp_path, key_data)?;
-        
+
         let output = Command::new("gpg")
             .arg("--import")
             .arg("--verbose")
@@ -108,10 +112,10 @@ impl GpgVerifier {
             .arg(&self.keyring_path)
             .arg(temp_path)
             .output()?;
-        
+
         // Clean up temp file
         let _ = fs::remove_file(temp_path);
-        
+
         // Extract key ID from output
         let output_str = String::from_utf8_lossy(&output.stdout);
         if let Some(key_line) = output_str.lines().find(|line| line.contains("imported")) {
@@ -121,23 +125,35 @@ impl GpgVerifier {
                 return Ok(key_id.to_string());
             }
         }
-        
+
         Err(anyhow!("Failed to import GPG key"))
     }
 
     pub fn import_debian_keys(&self) -> Result<()> {
         info!("Importing Debian archive keys");
-        
+
         // Debian archive keys for recent releases
         let debian_keys = vec![
-            ("debian-archive-bullseye-automatic", "https://ftp-master.debian.org/keys/archive-keys-10.asc"),
-            ("debian-archive-bullseye-security-automatic", "https://ftp-master.debian.org/keys/archive-keys-10.asc"),
-            ("debian-archive-bookworm-automatic", "https://ftp-master.debian.org/keys/archive-keys-12.asc"),
-            ("debian-archive-bookworm-security-automatic", "https://ftp-master.debian.org/keys/archive-keys-12.asc"),
+            (
+                "debian-archive-bullseye-automatic",
+                "https://ftp-master.debian.org/keys/archive-keys-10.asc",
+            ),
+            (
+                "debian-archive-bullseye-security-automatic",
+                "https://ftp-master.debian.org/keys/archive-keys-10.asc",
+            ),
+            (
+                "debian-archive-bookworm-automatic",
+                "https://ftp-master.debian.org/keys/archive-keys-12.asc",
+            ),
+            (
+                "debian-archive-bookworm-security-automatic",
+                "https://ftp-master.debian.org/keys/archive-keys-12.asc",
+            ),
         ];
-        
+
         let mut imported_keys = Vec::new();
-        
+
         for (key_name, key_url) in debian_keys {
             match self.download_and_import_key(key_url) {
                 Ok(key_id) => {
@@ -145,35 +161,38 @@ impl GpgVerifier {
                     imported_keys.push(key_id);
                 }
                 Err(e) => {
-                    warn!("Failed to import Debian key {}: {} - {}", key_name, key_url, e);
+                    warn!(
+                        "Failed to import Debian key {}: {} - {}",
+                        key_name, key_url, e
+                    );
                 }
             }
         }
-        
-        info!("Successfully imported {} Debian archive keys", imported_keys.len());
+
+        info!(
+            "Successfully imported {} Debian archive keys",
+            imported_keys.len()
+        );
         Ok(())
     }
 
     fn download_and_import_key(&self, key_url: &str) -> Result<String> {
         info!("Downloading key from: {}", key_url);
-        
+
         // Download key using curl (or reqwest in async context)
-        let output = Command::new("curl")
-            .arg("-s")
-            .arg(key_url)
-            .output()?;
-        
+        let output = Command::new("curl").arg("-s").arg(key_url).output()?;
+
         if !output.status.success() {
             return Err(anyhow!("Failed to download key from {}", key_url));
         }
-        
+
         self.import_key(&output.stdout)
     }
 
     fn parse_gpg_output(&self, output: &std::process::Output) -> Result<GpgVerificationResult> {
         let output_str = String::from_utf8_lossy(&output.stdout);
         let error_str = String::from_utf8_lossy(&output.stderr);
-        
+
         if output.status.success() {
             // Parse successful verification
             let mut result = GpgVerificationResult {
@@ -183,7 +202,7 @@ impl GpgVerifier {
                 trust_level: "ultimate".to_string(),
                 error_message: None,
             };
-            
+
             // Extract key information from output
             for line in output_str.lines() {
                 if line.contains("using RSA key") {
@@ -192,7 +211,7 @@ impl GpgVerifier {
                     }
                 }
             }
-            
+
             Ok(result)
         } else {
             // Parse error
@@ -201,7 +220,7 @@ impl GpgVerifier {
             } else {
                 error_str.to_string()
             };
-            
+
             Ok(GpgVerificationResult {
                 valid: false,
                 key_id: None,
@@ -215,7 +234,7 @@ impl GpgVerifier {
     fn parse_key_list(&self, output: &std::process::Output) -> Result<Vec<GpgKeyInfo>> {
         let output_str = String::from_utf8_lossy(&output.stdout);
         let mut keys = Vec::new();
-        
+
         for line in output_str.lines() {
             if line.starts_with("pub:") {
                 if let Some(key_info) = self.parse_key_line(line) {
@@ -223,7 +242,7 @@ impl GpgVerifier {
                 }
             }
         }
-        
+
         Ok(keys)
     }
 
@@ -232,12 +251,16 @@ impl GpgVerifier {
         if parts.len() < 10 {
             return None;
         }
-        
+
         Some(GpgKeyInfo {
             key_id: parts.get(4).unwrap_or(&"").to_string(),
             user_id: parts.get(9).unwrap_or(&"").to_string(),
             creation_date: parts.get(5).unwrap_or(&"").to_string(),
-            expiration_date: if parts.get(6).unwrap_or(&"").is_empty() { None } else { Some(parts[6].to_string()) },
+            expiration_date: if parts.get(6).unwrap_or(&"").is_empty() {
+                None
+            } else {
+                Some(parts[6].to_string())
+            },
             fingerprint: parts.get(11).unwrap_or(&"").to_string(),
             trust_level: parts.get(1).unwrap_or(&"").to_string(),
         })
@@ -245,7 +268,7 @@ impl GpgVerifier {
 
     pub fn verify_file_signature(&self, file_path: &str) -> Result<GpgVerificationResult> {
         info!("Verifying signature for file: {}", file_path);
-        
+
         let output = Command::new("gpg")
             .arg("--verify")
             .arg("--verbose")
@@ -253,20 +276,20 @@ impl GpgVerifier {
             .arg(&self.keyring_path)
             .arg(file_path)
             .output()?;
-        
+
         self.parse_gpg_output(&output)
     }
 
     pub fn get_keyring_info(&self) -> Result<KeyringInfo> {
         info!("Getting keyring information");
-        
+
         let output = Command::new("gpg")
             .arg("--list-keys")
             .arg("--with-colons")
             .arg("--keyring")
             .arg(&self.keyring_path)
             .output()?;
-        
+
         self.parse_keyring_info(&output)
     }
 
@@ -275,7 +298,7 @@ impl GpgVerifier {
         let mut key_count = 0;
         let mut trusted_keys = 0;
         let mut ultimate_keys = 0;
-        
+
         for line in output_str.lines() {
             if line.starts_with("pub:") {
                 key_count += 1;
@@ -287,7 +310,7 @@ impl GpgVerifier {
                 }
             }
         }
-        
+
         Ok(KeyringInfo {
             total_keys: key_count,
             trusted_keys,
@@ -320,7 +343,7 @@ mod tests {
     fn test_parse_key_line() {
         let verifier = GpgVerifier::new("test.gpg");
         let line = "pub:u:2048:1:1234567890ABCDEF:2023-01-01::e:u:John Doe <johndoe@example.com>:SC:ABCDEF1234567890ABCDEF";
-        
+
         if let Some(key_info) = verifier.parse_key_line(line) {
             assert_eq!(key_info.key_id, "1234567890ABCDEF");
             assert_eq!(key_info.user_id, "John Doe <johndoe@example.com>");

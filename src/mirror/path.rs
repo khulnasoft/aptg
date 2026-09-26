@@ -1,4 +1,3 @@
-
 pub struct PathParser;
 
 impl PathParser {
@@ -6,9 +5,9 @@ impl PathParser {
         if !path.starts_with("/debian/") {
             return Err("Invalid Debian path".to_string());
         }
-        
+
         let remaining = &path[8..]; // Remove "/debian/"
-        
+
         if remaining.starts_with("dists/") {
             Self::parse_release_path(remaining)
         } else if remaining.starts_with("pool/") {
@@ -17,18 +16,18 @@ impl PathParser {
             Err("Unknown Debian path type".to_string())
         }
     }
-    
+
     fn parse_release_path(path: &str) -> Result<DebianPath, String> {
         // Example: /debian/dists/bookworm/InRelease
         // Example: /debian/dists/bookworm/main/binary-amd64/Packages.gz
         let parts: Vec<&str> = path.split('/').collect();
-        
+
         if parts.len() < 2 {
             return Err("Invalid release path format".to_string());
         }
-        
+
         let suite = parts[1].to_string(); // bookworm, bullseye, etc.
-        
+
         // Handle different path structures
         let (component, architecture, filename) = if parts.len() == 2 {
             // /debian/dists/bookworm/InRelease
@@ -64,7 +63,7 @@ impl PathParser {
                 parts.last().map(|s| s.to_string()),
             )
         };
-        
+
         Ok(DebianPath {
             path_type: PathType::Release,
             suite,
@@ -73,20 +72,20 @@ impl PathParser {
             filename,
         })
     }
-    
+
     fn parse_package_path(path: &str) -> Result<DebianPath, String> {
         // Example: pool/main/a/apt/apt_2.6.1_amd64.deb (after removing /debian/)
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        
+
         if parts.len() < 4 {
             return Err("Invalid package path format".to_string());
         }
-        
+
         // Pool path structure: pool/{component}/{first-letter}/{package}/{package}_{version}_{arch}.deb
         // parts[0]="pool", parts[1]="main", parts[2]="a", parts[3]="apt", ...
         let component = parts.get(1).map(|s| s.to_string());
         let filename = parts.last().map(|s| s.to_string());
-        
+
         Ok(DebianPath {
             path_type: PathType::Package,
             suite: String::new(), // Packages don't have suite in path
@@ -108,8 +107,8 @@ pub struct DebianPath {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PathType {
-    Release,    // Release files, Packages indices
-    Package,    // .deb files
+    Release, // Release files, Packages indices
+    Package, // .deb files
 }
 
 #[cfg(test)]
@@ -120,7 +119,7 @@ mod tests {
     fn test_parse_release_path_simple() {
         let path = "/debian/dists/bookworm/InRelease";
         let result = PathParser::parse_debian_path(path).unwrap();
-        
+
         assert_eq!(result.path_type, PathType::Release);
         assert_eq!(result.suite, "bookworm");
         assert!(result.component.is_none());
@@ -130,7 +129,7 @@ mod tests {
     fn test_parse_release_path_packages() {
         let path = "/debian/dists/bookworm/main/binary-amd64/Packages.gz";
         let result = PathParser::parse_debian_path(path).unwrap();
-        
+
         assert_eq!(result.path_type, PathType::Release);
         assert_eq!(result.suite, "bookworm");
         assert_eq!(result.component.as_deref(), Some("main"));
@@ -142,7 +141,7 @@ mod tests {
     fn test_parse_package_path() {
         let path = "/debian/pool/main/a/apt/apt_2.6.1_amd64.deb";
         let result = PathParser::parse_debian_path(path).unwrap();
-        
+
         assert_eq!(result.path_type, PathType::Package);
         assert_eq!(result.component.as_deref(), Some("main"));
         assert_eq!(result.filename.as_deref(), Some("apt_2.6.1_amd64.deb"));
@@ -158,7 +157,7 @@ mod tests {
     fn test_path_components_extraction() {
         let path = "/debian/dists/bullseye/main/source/Sources.gz";
         let result = PathParser::parse_debian_path(path).unwrap();
-        
+
         assert_eq!(result.suite, "bullseye");
         assert_eq!(result.component.as_deref(), Some("main"));
         assert_eq!(result.architecture.as_deref(), Some("source"));

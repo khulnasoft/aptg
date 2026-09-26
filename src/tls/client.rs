@@ -1,10 +1,10 @@
-use anyhow::{Result, anyhow};
-use reqwest::{Client, Certificate};
+use anyhow::{anyhow, Result};
+use reqwest::{Certificate, Client};
+use rustls::RootCertStore;
+use rustls_pemfile::certs;
 use std::fs::File;
 use std::io::BufReader;
-use rustls::{ClientConfig, RootCertStore};
-use rustls_pemfile::{certs, pkcs8_private_keys};
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 
 pub struct TlsClientConfig {
     pub ca_cert_path: Option<String>,
@@ -34,16 +34,13 @@ pub struct TlsClient {
 impl TlsClient {
     pub fn new(config: TlsClientConfig) -> Result<Self> {
         let client = Self::build_client(&config)?;
-        
-        Ok(Self {
-            config,
-            client,
-        })
+
+        Ok(Self { config, client })
     }
 
     fn build_client(config: &TlsClientConfig) -> Result<Client> {
         info!("Building TLS client configuration");
-        
+
         let mut client_builder = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("aptg/0.1.0");
@@ -51,31 +48,31 @@ impl TlsClient {
         // Configure custom CA certificates
         if let Some(ref ca_cert_path) = config.ca_cert_path {
             info!("Loading custom CA certificate from: {}", ca_cert_path);
-            
+
             let ca_cert_data = std::fs::read(ca_cert_path)
                 .map_err(|e| anyhow!("Failed to read CA certificate: {}", e))?;
-            
+
             let cert = Certificate::from_pem(&ca_cert_data)
                 .map_err(|e| anyhow!("Failed to parse CA certificate: {}", e))?;
-            
+
             client_builder = client_builder.add_root_certificate(cert);
         }
 
         // Configure client authentication
-        if let (Some(ref client_cert_path), Some(ref client_key_path)) = 
-            (&config.client_cert_path, &config.client_key_path) {
+        if let (Some(ref client_cert_path), Some(ref client_key_path)) =
+            (&config.client_cert_path, &config.client_key_path)
+        {
             info!("Loading client certificate from: {}", client_cert_path);
             info!("Loading client private key from: {}", client_key_path);
-            
+
             let cert_data = std::fs::read(client_cert_path)
                 .map_err(|e| anyhow!("Failed to read client certificate: {}", e))?;
             let key_data = std::fs::read(client_key_path)
                 .map_err(|e| anyhow!("Failed to read client private key: {}", e))?;
-            
-            let identity = reqwest::Identity::from_pem(
-                &[cert_data, key_data].concat()
-            ).map_err(|e| anyhow!("Failed to create client identity: {}", e))?;
-            
+
+            let identity = reqwest::Identity::from_pem(&[cert_data, key_data].concat())
+                .map_err(|e| anyhow!("Failed to create client identity: {}", e))?;
+
             client_builder = client_builder.identity(identity);
         }
 
@@ -99,8 +96,9 @@ impl TlsClient {
 
     pub async fn get(&self, url: &str) -> Result<reqwest::Response> {
         info!("Making TLS GET request to: {}", url);
-        
-        let response = self.client
+
+        let response = self
+            .client
             .get(url)
             .send()
             .await
@@ -112,8 +110,9 @@ impl TlsClient {
 
     pub async fn head(&self, url: &str) -> Result<reqwest::Response> {
         info!("Making TLS HEAD request to: {}", url);
-        
-        let response = self.client
+
+        let response = self
+            .client
             .head(url)
             .send()
             .await
@@ -135,10 +134,10 @@ impl TlsClient {
 
     pub fn reload_config(&mut self) -> Result<()> {
         info!("Reloading TLS client configuration");
-        
+
         let new_client = Self::build_client(&self.config)?;
         self.client = new_client;
-        
+
         info!("TLS client configuration reloaded successfully");
         Ok(())
     }
@@ -180,7 +179,7 @@ pub struct CertificateValidator {
 impl CertificateValidator {
     pub fn new() -> Self {
         let mut trusted_certs = RootCertStore::empty();
-        
+
         // Add system root certificates
         match rustls_native_certs::load_native_certs() {
             Ok(certs) => {
@@ -194,7 +193,7 @@ impl CertificateValidator {
                 warn!("Failed to load system certificates: {}", e);
             }
         }
-        
+
         Self { trusted_certs }
     }
 
@@ -203,13 +202,13 @@ impl CertificateValidator {
             .map_err(|e| anyhow!("Failed to open certificate file {}: {}", cert_path, e))?;
         let mut cert_reader = BufReader::new(cert_file);
         let certs = certs(&mut cert_reader)?;
-        
+
         for cert_der in certs {
             self.trusted_certs
                 .add(&rustls::Certificate(cert_der))
                 .map_err(|e| anyhow!("Failed to add trusted certificate: {}", e))?;
         }
-        
+
         Ok(())
     }
 
@@ -217,7 +216,7 @@ impl CertificateValidator {
         // In a real implementation, you'd perform proper certificate validation
         // For now, we'll just check if it's in our trusted store
         info!("Validating certificate");
-        
+
         // This is a simplified validation
         // Real implementation would check expiration, hostname, chain, etc.
         Ok(true)

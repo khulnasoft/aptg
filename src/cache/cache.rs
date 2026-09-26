@@ -1,9 +1,9 @@
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use warp::Reply;
-use bytes::Bytes;
 use tracing::{info, warn};
+use warp::Reply;
 
 pub struct CacheManager {
     cache: RwLock<HashMap<String, CacheEntry>>,
@@ -48,40 +48,40 @@ impl CacheManager {
             ttl_config: TtlConfig::default(),
         }
     }
-    
+
     pub async fn get(&self, path: &str) -> Option<impl Reply> {
         let cache = self.cache.read().await;
-        
+
         if let Some(entry) = cache.get(path) {
             if entry.created_at.elapsed() < entry.ttl {
                 info!("Cache hit for: {}", path);
-                
+
                 let _response = warp::reply::Response::new(entry.data.body.clone().into());
-                
+
                 // Copy headers and status
                 let reply = CachedResponse {
                     status: entry.data.status,
                     headers: entry.data.headers.clone(),
                     body: entry.data.body.clone(),
                 };
-                
+
                 return Some(self.create_warp_response(reply));
             } else {
                 warn!("Cache expired for: {}", path);
             }
         }
-        
+
         None
     }
-    
-    pub async fn store(&self, path: &str, response: &impl Reply) {
+
+    pub async fn store(&self, path: &str, _response: &impl Reply) {
         let ttl = self.determine_ttl(path);
-        
+
         // For now, we'll skip caching since we can't properly extract response data
         // In a real implementation, you'd need to properly extract the response data
         info!("Skipping cache storage for: {} (TTL: {:?})", path, ttl);
     }
-    
+
     fn determine_ttl(&self, path: &str) -> Duration {
         if path.contains("InRelease") || path.contains("Release") || path.contains("Release.gpg") {
             self.ttl_config.release_ttl
@@ -93,8 +93,11 @@ impl CacheManager {
             Duration::from_secs(3600) // Default 1 hour
         }
     }
-    
-    async fn extract_response_data(&self, _response: &impl Reply) -> Result<CachedResponse, Box<dyn std::error::Error + Send + Sync>> {
+
+    async fn extract_response_data(
+        &self,
+        _response: &impl Reply,
+    ) -> Result<CachedResponse, Box<dyn std::error::Error + Send + Sync>> {
         // This is a simplified version - in practice, you'd need to properly extract
         // the response data from the warp Reply
         // For now, we'll create a placeholder
@@ -104,24 +107,24 @@ impl CacheManager {
             body: Bytes::new(),
         })
     }
-    
+
     fn create_warp_response(&self, cached: CachedResponse) -> impl Reply {
         let mut response = warp::reply::Response::new(cached.body.into());
         *response.headers_mut() = cached.headers;
         *response.status_mut() = cached.status;
         response
     }
-    
+
     pub async fn clear(&self) {
         let mut cache = self.cache.write().await;
         cache.clear();
         info!("Cache cleared");
     }
-    
+
     pub async fn cleanup_expired(&self) {
         let mut cache = self.cache.write().await;
         let now = Instant::now();
-        
+
         cache.retain(|path, entry| {
             let is_valid = now.duration_since(entry.created_at) < entry.ttl;
             if !is_valid {
