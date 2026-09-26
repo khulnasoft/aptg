@@ -3,3 +3,4 @@ certs/
 keyring/
 *.mmdb
 .DS_Store
+banlist.json
