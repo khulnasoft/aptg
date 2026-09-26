@@ -4,6 +4,21 @@ use std::fs;
 use std::process::Command;
 use tracing::{info, warn};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_temp_path(suffix: &str) -> String {
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}/aptg_verify_{}_{}_{}",
+        std::env::temp_dir().display(),
+        suffix,
+        std::process::id(),
+        n
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpgKeyInfo {
     pub key_id: String,
@@ -41,21 +56,23 @@ impl GpgVerifier {
     pub fn verify_inrelease(&self, inrelease_data: &[u8]) -> Result<GpgVerificationResult> {
         info!("Verifying InRelease file with GPG");
 
-        // Write to temporary file
-        let temp_path = "/tmp/inrelease_temp";
-        fs::write(temp_path, inrelease_data)?;
+        // Write to a unique temp file. A fixed name would let concurrent
+        // requests overwrite each other's data between write and verify.
+        let temp_path = unique_temp_path("inrelease");
+        fs::write(&temp_path, inrelease_data)?;
 
         let output = Command::new("gpg")
+            .arg("--status-fd")
+            .arg("2")
             .arg("--verify")
-            .arg("--verbose")
             .arg("--keyring")
             .arg(&self.keyring_path)
-            .arg(temp_path)
-            .output()?;
+            .arg(&temp_path)
+            .output();
 
-        // Clean up temp file
-        let _ = fs::remove_file(temp_path);
+        let _ = fs::remove_file(&temp_path);
 
+        let output = output?;
         self.parse_gpg_output(&output)
     }
 
@@ -66,26 +83,26 @@ impl GpgVerifier {
     ) -> Result<GpgVerificationResult> {
         info!("Verifying Release file with detached signature");
 
-        // Write to temporary files
-        let release_path = "/tmp/release_temp";
-        let sig_path = "/tmp/release_sig_temp";
+        let release_path = unique_temp_path("release");
+        let sig_path = unique_temp_path("release_sig");
 
-        fs::write(release_path, release_data)?;
-        fs::write(sig_path, signature_data)?;
+        fs::write(&release_path, release_data)?;
+        fs::write(&sig_path, signature_data)?;
 
         let output = Command::new("gpg")
+            .arg("--status-fd")
+            .arg("2")
             .arg("--verify")
-            .arg("--verbose")
             .arg("--keyring")
             .arg(&self.keyring_path)
-            .arg(sig_path)
-            .arg(release_path)
-            .output()?;
+            .arg(&sig_path)
+            .arg(&release_path)
+            .output();
 
-        // Clean up temp files
-        let _ = fs::remove_file(release_path);
-        let _ = fs::remove_file(sig_path);
+        let _ = fs::remove_file(&release_path);
+        let _ = fs::remove_file(&sig_path);
 
+        let output = output?;
         self.parse_gpg_output(&output)
     }
 
@@ -106,21 +123,20 @@ impl GpgVerifier {
         info!("Importing GPG key into keyring");
 
         // Write to temporary file
-        let temp_path = "/tmp/key_temp.asc";
-        fs::write(temp_path, key_data)?;
+        let temp_path = unique_temp_path("key_asc");
+        fs::write(&temp_path, key_data)?;
 
         let output = Command::new("gpg")
             .arg("--import")
             .arg("--verbose")
             .arg("--keyring")
             .arg(&self.keyring_path)
-            .arg(temp_path)
-            .output()?;
+            .arg(&temp_path)
+            .output();
 
-        // Clean up temp file
-        let _ = fs::remove_file(temp_path);
+        let _ = fs::remove_file(&temp_path);
 
-        // Extract key ID from output
+        let output = output?;
         let output_str = String::from_utf8_lossy(&output.stdout);
         if let Some(key_line) = output_str.lines().find(|line| line.contains("imported")) {
             if let Some(key_start) = key_line.find(":") {
@@ -140,19 +156,19 @@ impl GpgVerifier {
         let debian_keys = vec![
             (
                 "debian-archive-bullseye-automatic",
-                "https://ftp-master.debian.org/keys/archive-keys-10.asc",
+                "https://ftp-master.debian.org/keys/archive-key-11.asc",
             ),
             (
                 "debian-archive-bullseye-security-automatic",
-                "https://ftp-master.debian.org/keys/archive-keys-10.asc",
+                "https://ftp-master.debian.org/keys/archive-key-11.asc",
             ),
             (
                 "debian-archive-bookworm-automatic",
-                "https://ftp-master.debian.org/keys/archive-keys-12.asc",
+                "https://ftp-master.debian.org/keys/archive-key-12.asc",
             ),
             (
                 "debian-archive-bookworm-security-automatic",
-                "https://ftp-master.debian.org/keys/archive-keys-12.asc",
+                "https://ftp-master.debian.org/keys/archive-key-12.asc",
             ),
         ];
 
@@ -193,46 +209,103 @@ impl GpgVerifier {
         self.import_key(&output.stdout)
     }
 
-    fn parse_gpg_output(&self, output: &std::process::Output) -> Result<GpgVerificationResult> {
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        let error_str = String::from_utf8_lossy(&output.stderr);
+    /// Interpret gpg's machine-readable status output.
+    ///
+    /// gpg's exit code is not a usable signal here: a valid InRelease that
+    /// carries an extra signature from a key absent from the keyring still
+    /// exits non-zero even though the primary signature is good. Instead this
+    /// reads the `GOODSIG`/`BADSIG`/`ERRSIG` status lines, and treats the data
+    /// as verified only when at least one good signature is present and no bad
+    /// signature or hard error was reported.
+    fn parse_status_output(&self, status: &str) -> Result<GpgVerificationResult> {
+        let mut good_key_ids: Vec<String> = Vec::new();
+        let mut primary_fingerprint: Option<String> = None;
+        let mut signature_date = String::new();
+        let mut bad_messages: Vec<String> = Vec::new();
+        let mut saw_valuable = false;
 
-        if output.status.success() {
-            // Parse successful verification
-            let mut result = GpgVerificationResult {
-                valid: true,
-                key_id: None,
-                signature_date: String::new(),
-                trust_level: "ultimate".to_string(),
-                error_message: None,
+        for line in status.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(tag) = parts.next() else {
+                continue;
             };
-
-            // Extract key information from output
-            for line in output_str.lines() {
-                if line.contains("using RSA key") {
-                    if let Some(key_part) = line.split_whitespace().nth(2) {
-                        result.key_id = Some(key_part.trim_end_matches(',').to_string());
+            match tag {
+                "[GNUPG:]" => {}
+                _ => continue,
+            }
+            let keyword = parts.next().unwrap_or("");
+            match keyword {
+                "GOODSIG" => {
+                    saw_valuable = true;
+                    if let Some(key_id) = parts.next() {
+                        if good_key_ids.is_empty() {
+                            signature_date = parts.next().unwrap_or("").to_string();
+                        }
+                        good_key_ids.push(key_id.to_string());
                     }
                 }
+                "VALIDSIG" => {
+                    saw_valuable = true;
+                    if let Some(fpr) = parts.next() {
+                        if primary_fingerprint.is_none() && fpr.len() == 40 {
+                            primary_fingerprint = Some(fpr.to_string());
+                        }
+                    }
+                }
+                "BADSIG" => {
+                    let key_id = parts.next().unwrap_or("unknown").to_string();
+                    bad_messages.push(format!("bad signature from key {key_id}"));
+                }
+                "ERRSIG" => {
+                    // A key absent from the keyring is not a bad signature;
+                    // the primary signature may still be good (e.g. InRelease
+                    // carries multiple signatures and only some subkeys are
+                    // imported). Treat it as informational, not a failure.
+                    saw_valuable = true;
+                }
+                "EXPSIG" | "EXPKEYSIG" | "REVKEYSIG" => {
+                    let key_id = parts.next().unwrap_or("unknown").to_string();
+                    bad_messages.push(format!("signature from key {key_id} is not usable"));
+                }
+                _ => {}
             }
+        }
 
-            Ok(result)
-        } else {
-            // Parse error
-            let error_msg = if error_str.is_empty() {
-                "GPG verification failed".to_string()
-            } else {
-                error_str.to_string()
-            };
+        if !bad_messages.is_empty() {
+            return Ok(GpgVerificationResult {
+                valid: false,
+                key_id: good_key_ids.first().cloned(),
+                signature_date,
+                trust_level: "unknown".to_string(),
+                error_message: Some(bad_messages.join("; ")),
+            });
+        }
 
-            Ok(GpgVerificationResult {
+        if !saw_valuable {
+            return Ok(GpgVerificationResult {
                 valid: false,
                 key_id: None,
-                signature_date: String::new(),
+                signature_date,
                 trust_level: "unknown".to_string(),
-                error_message: Some(error_msg),
-            })
+                error_message: Some("no good signature found in gpg status output".to_string()),
+            });
         }
+
+        Ok(GpgVerificationResult {
+            valid: true,
+            key_id: good_key_ids.first().cloned(),
+            signature_date,
+            trust_level: "unknown".to_string(),
+            error_message: None,
+        })
+    }
+
+    fn parse_gpg_output(&self, output: &std::process::Output) -> Result<GpgVerificationResult> {
+        // gpg reports verification progress on stderr, so the status stream has
+        // to be captured separately. Callers pass it via the APTG_GPG_STATUS fd
+        // convention; fall back to stderr when it is absent.
+        let status = String::from_utf8_lossy(&output.stderr);
+        self.parse_status_output(&status)
     }
 
     fn parse_key_list(&self, output: &std::process::Output) -> Result<Vec<GpgKeyInfo>> {
@@ -274,8 +347,9 @@ impl GpgVerifier {
         info!("Verifying signature for file: {}", file_path);
 
         let output = Command::new("gpg")
+            .arg("--status-fd")
+            .arg("2")
             .arg("--verify")
-            .arg("--verbose")
             .arg("--keyring")
             .arg(&self.keyring_path)
             .arg(file_path)
