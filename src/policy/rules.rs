@@ -2,6 +2,7 @@ use crate::mirror::path::{DebianPath, PathParser, PathType};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -128,6 +129,7 @@ pub struct PolicyEngine {
     rate_limiter: RateLimiter,
     banlist: HashSet<String>,
     banned_until: HashMap<String, Instant>,
+    banlist_path: PathBuf,
 }
 
 impl Default for PolicyEngine {
@@ -139,10 +141,14 @@ impl Default for PolicyEngine {
 impl PolicyEngine {
     pub fn new() -> Self {
         let config = PolicyConfig::default();
-        Self::from_config(config)
+        Self::from_config_with_banlist(config, PathBuf::from("banlist.json"))
     }
 
     pub fn from_config(config: PolicyConfig) -> Self {
+        Self::from_config_with_banlist(config, PathBuf::from("banlist.json"))
+    }
+
+    pub fn from_config_with_banlist(config: PolicyConfig, banlist_path: PathBuf) -> Self {
         let allowed_suites: HashSet<String> = config.allow.suites.iter().cloned().collect();
         let allowed_components: HashSet<String> = config.allow.components.iter().cloned().collect();
         let allowed_architectures: HashSet<String> =
@@ -156,7 +162,7 @@ impl PolicyEngine {
             config.limits.burst_size,
         );
 
-        Self {
+        let mut engine = Self {
             config,
             allowed_suites,
             allowed_components,
@@ -166,7 +172,10 @@ impl PolicyEngine {
             rate_limiter,
             banlist: HashSet::new(),
             banned_until: HashMap::new(),
-        }
+            banlist_path,
+        };
+        engine.load_banlist();
+        engine
     }
 
     pub async fn check_request(
@@ -229,6 +238,56 @@ impl PolicyEngine {
         self.banned_until.remove(ip);
         self.rate_limiter.requests.write().await.remove(ip);
         info!("Client {} unbanned", ip);
+        let _ = self.save_banlist();
+    }
+
+    fn save_banlist(&self) -> Result<()> {
+        let active: Vec<String> = self
+            .banlist
+            .iter()
+            .filter(|ip| {
+                self.banned_until
+                    .get(*ip)
+                    .map(|until| Instant::now() < *until)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        let json = serde_json::to_string(&active)?;
+        std::fs::write(&self.banlist_path, json)?;
+        Ok(())
+    }
+
+    fn load_banlist(&mut self) {
+        let Ok(json) = std::fs::read_to_string(&self.banlist_path) else {
+            return;
+        };
+        let Ok(ips): Result<Vec<String>, _> = serde_json::from_str(&json) else {
+            return;
+        };
+        let now = Instant::now();
+        for ip in ips {
+            if let Some(until) = self.banned_until.get(&ip) {
+                if now < *until {
+                    self.banlist.insert(ip);
+                }
+            }
+        }
+    }
+
+    pub fn reload_from_config(&mut self, config: PolicyConfig) {
+        self.rate_limiter = RateLimiter::new(
+            config.limits.max_requests_per_minute_per_ip,
+            config.limits.burst_size,
+        );
+        self.config = config.clone();
+        self.allowed_suites = config.allow.suites.iter().cloned().collect();
+        self.allowed_components = config.allow.components.iter().cloned().collect();
+        self.allowed_architectures = config.allow.architectures.iter().cloned().collect();
+        self.denied_architectures = config.deny.architectures.iter().cloned().collect();
+        self.denied_packages = config.deny.packages.iter().cloned().collect();
+        let _ = self.save_banlist();
+        info!("Policy configuration reloaded");
     }
 
     fn check_release_policy(&self, path: &DebianPath) -> Result<()> {

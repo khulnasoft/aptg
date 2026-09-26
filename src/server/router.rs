@@ -61,6 +61,7 @@ fn with_suite(
 
 pub async fn build_routes(
     app_config: Arc<tokio::sync::RwLock<config::AppConfig>>,
+    policy_engine: Arc<tokio::sync::RwLock<PolicyEngine>>,
 ) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
     let config_init = app_config.read().await;
     let suite = config_init.upstream.suite.clone();
@@ -71,7 +72,6 @@ pub async fn build_routes(
     let audit = Arc::new(AuditLogger::with_log_file(&config_init.audit.log_file));
     let gpg_verifier = Arc::new(GpgVerifier::new(&config_init.verification.gpg_keyring_path));
     drop(config_init);
-    let policy = Arc::new(PolicyEngine::new());
     let cache = Arc::new(CacheManager::new());
     let geo_policy = GeoPolicy::default();
     let geo_policy_engine = Arc::new(GeoPolicyEngine::new(geo_policy));
@@ -85,7 +85,7 @@ pub async fn build_routes(
         .and(warp::addr::remote())
         .and(with_suite(suite))
         .and(with_fetcher(fetcher.clone()))
-        .and(with_policy(policy.clone()))
+        .and(with_policy(policy_engine.clone()))
         .and(with_cache(cache.clone()))
         .and(with_audit(audit.clone()))
         .and(with_gpg_verifier(gpg_verifier.clone()))
@@ -197,7 +197,7 @@ async fn handle_debian_request(
     remote_addr: Option<SocketAddr>,
     suite: String,
     fetcher: Arc<MirrorFetcher>,
-    policy: Arc<PolicyEngine>,
+    policy_engine: Arc<tokio::sync::RwLock<PolicyEngine>>,
     cache: Arc<CacheManager>,
     audit: Arc<AuditLogger>,
     gpg_verifier: Arc<GpgVerifier>,
@@ -218,7 +218,9 @@ async fn handle_debian_request(
     // denied. With the socket peer fallback in extract_client_ip this now only
     // happens when the transport exposes no remote address.
     let allowed = match &client_ip {
-        Some(ip) => policy
+        Some(ip) => policy_engine
+            .read()
+            .await
             .check_request(ip, &path, &method)
             .await
             .unwrap_or(false),
@@ -514,7 +516,11 @@ mod tests {
             },
             policy: crate::policy::rules::PolicyConfig::default(),
         }));
-        let routes = build_routes(app_config).await;
+        let routes = build_routes(
+            app_config,
+            Arc::new(tokio::sync::RwLock::new(PolicyEngine::new())),
+        )
+        .await;
         let resp = warp::test::request()
             .method("GET")
             .path("/debian/pool/main/a/apt/apt_2.6.1_amd64.deb")

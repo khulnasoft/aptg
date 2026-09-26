@@ -1,4 +1,4 @@
-use crate::policy::rules::PolicyConfig;
+use crate::policy::rules::{PolicyConfig, PolicyEngine};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -99,12 +99,16 @@ impl AppConfig {
         .ok();
     }
 
-    pub fn spawn_watcher(self_: Arc<RwLock<Self>>, path: PathBuf) {
+    pub fn spawn_watcher(
+        self_: Arc<RwLock<Self>>,
+        path: PathBuf,
+        policy_engine: Arc<RwLock<PolicyEngine>>,
+    ) {
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(5));
             loop {
                 ticker.tick().await;
-                if let Err(e) = try_reload(&self_, &path).await {
+                if let Err(e) = try_reload(&self_, &path, &policy_engine).await {
                     warn!("config watch error: {}", e);
                 }
             }
@@ -112,7 +116,11 @@ impl AppConfig {
     }
 }
 
-async fn try_reload(config: &Arc<RwLock<AppConfig>>, path: &std::path::Path) -> Result<()> {
+async fn try_reload(
+    config: &Arc<RwLock<AppConfig>>,
+    path: &std::path::Path,
+    policy_engine: &Arc<RwLock<PolicyEngine>>,
+) -> Result<()> {
     let metadata = match tokio::fs::metadata(path).await {
         Ok(m) => m,
         Err(e) => return Err(anyhow!("config metadata: {}", e)),
@@ -131,8 +139,13 @@ async fn try_reload(config: &Arc<RwLock<AppConfig>>, path: &std::path::Path) -> 
     }
 
     let new = AppConfig::load(path)?;
+    let policy_config = new.policy.clone();
     config.write().await.clone_from(&new);
     CONFIG_MTIME.store(mtime, Ordering::Relaxed);
+    policy_engine
+        .write()
+        .await
+        .reload_from_config(policy_config);
     info!("config reloaded from {}", path.display());
     Ok(())
 }

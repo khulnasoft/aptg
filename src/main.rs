@@ -33,7 +33,20 @@ async fn main() -> Result<()> {
     let config = Arc::new(tokio::sync::RwLock::new(aptg::config::AppConfig::load(
         &config_path,
     )?));
-    aptg::config::AppConfig::spawn_watcher(config.clone(), config_path.clone());
+
+    let policy_config = config.read().await.policy.clone();
+    let policy_engine = Arc::new(tokio::sync::RwLock::new(
+        aptg::policy::rules::PolicyEngine::from_config_with_banlist(
+            policy_config,
+            PathBuf::from("banlist.json"),
+        ),
+    ));
+
+    aptg::config::AppConfig::spawn_watcher(
+        config.clone(),
+        config_path.clone(),
+        policy_engine.clone(),
+    );
 
     let cfg = config.read().await;
     let addr: SocketAddr = ([0, 0, 0, 0], cfg.server.port).into();
@@ -44,7 +57,7 @@ async fn main() -> Result<()> {
     );
     drop(cfg);
 
-    let routes = aptg::server::router::build_routes(config).await;
+    let routes = aptg::server::router::build_routes(config, policy_engine).await;
     warp::serve(routes).run(addr).await;
 
     Ok(())
