@@ -48,6 +48,12 @@ pub struct AuditLogger {
     // For now, we'll just log via tracing
 }
 
+impl Default for AuditLogger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AuditLogger {
     pub fn new() -> Self {
         Self {}

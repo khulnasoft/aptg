@@ -1,6 +1,7 @@
 use anyhow::Result;
 use aptg::tls::certificate_simple::CertificateManager;
 use std::fs;
+#[allow(clippy::single_component_path_imports)]
 use tracing_subscriber;
 
 fn main() -> Result<()> {

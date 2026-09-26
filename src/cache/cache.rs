@@ -44,6 +44,12 @@ impl Default for TtlConfig {
     }
 }
 
+impl Default for CacheManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CacheManager {
     pub fn new() -> Self {
         Self {
@@ -115,7 +121,7 @@ impl CacheManager {
         response: impl Reply,
     ) -> Result<CachedResponse, Box<dyn std::error::Error + Send + Sync>> {
         let resp = response.into_response();
-        let status = resp.status().clone();
+        let status = resp.status();
         let headers = resp.headers().clone();
         let body = hyper::body::to_bytes(resp.into_body()).await?;
         Ok(CachedResponse {
@@ -138,7 +144,7 @@ impl CacheManager {
         data: &CachedResponse,
         dir: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let safe_path = path.replace('/', "_").replace('\\', "_");
+        let safe_path = path.replace(['/', '\\'], "_");
         let dir = PathBuf::from(dir);
         fs::create_dir_all(&dir)?;
         let file_path = dir.join(format!("{}.cache", safe_path));
@@ -149,23 +155,8 @@ impl CacheManager {
         Ok(())
     }
 
-    fn load_from_disk(&self, path: &str, dir: &str) -> Option<CachedResponse> {
-        let safe_path = path.replace('/', "_").replace('\\', "_");
-        let file_path = PathBuf::from(dir).join(format!("{}.cache", safe_path));
-        if file_path.exists() {
-            let body = fs::read(&file_path).ok()?;
-            Some(CachedResponse {
-                status: warp::http::StatusCode::OK,
-                headers: warp::http::HeaderMap::new(),
-                body: Bytes::from(body),
-            })
-        } else {
-            None
-        }
-    }
-
     fn disk_cache_file_path(&self, path: &str, dir: &str) -> PathBuf {
-        let safe_path = path.replace('/', "_").replace('\\', "_");
+        let safe_path = path.replace(['/', '\\'], "_");
         PathBuf::from(dir).join(format!("{}.cache", safe_path))
     }
 

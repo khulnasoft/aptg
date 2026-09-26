@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::fs;
+#[allow(clippy::single_component_path_imports)]
 use tracing_subscriber;
 
 #[tokio::main]

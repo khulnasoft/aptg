@@ -80,7 +80,7 @@ impl LocationInfo {
     pub fn is_in_region(&self, region: &str) -> bool {
         self.region
             .as_ref()
-            .map_or(false, |r| r.to_lowercase() == region.to_lowercase())
+            .is_some_and(|r| r.to_lowercase() == region.to_lowercase())
     }
 
     pub fn is_in_continent(&self, continent_code: &str) -> bool {
@@ -143,7 +143,7 @@ impl LocationInfo {
         if let Some(offset) = self.get_timezone_offset() {
             let utc_hour = Utc::now().hour() as i32;
             let local_hour = (utc_hour + offset) % 24;
-            local_hour >= 9 && local_hour < 17
+            (9..17).contains(&local_hour)
         } else {
             false
         }
@@ -225,6 +225,12 @@ pub struct LocationStats {
     pub city_counts: HashMap<String, u64>,
     pub continent_counts: HashMap<String, u64>,
     pub last_updated: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for LocationStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LocationStats {

@@ -176,6 +176,12 @@ pub struct CertificateValidator {
     trusted_certs: RootCertStore,
 }
 
+impl Default for CertificateValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CertificateValidator {
     pub fn new() -> Self {
         let mut trusted_certs = RootCertStore::empty();
@@ -254,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_certificate_validator() {
-        let validator = CertificateValidator::new();
+        let _validator = CertificateValidator::new();
         // Test would require actual certificate data
     }
 }

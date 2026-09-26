@@ -83,7 +83,7 @@ impl MirrorFetcher {
     }
 
     fn get_file_name(&self, path: &str) -> String {
-        path.split('/').last().unwrap_or("").to_string()
+        path.split('/').next_back().unwrap_or("").to_string()
     }
 
     pub async fn health_check(&self) -> Result<bool> {
@@ -112,7 +112,7 @@ impl MirrorFetcher {
         let max_interval = Duration::from_secs(5);
 
         for attempt in 0..MAX_RETRIES {
-            match self.client.get(&format!("{}{}", url, path)).send().await {
+            match self.client.get(format!("{}{}", url, path)).send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
                         return Ok(resp);
@@ -147,7 +147,7 @@ impl MirrorFetcher {
     fn validate_content_length(&self, response: &Response, path: &str) -> Result<()> {
         let max_size = self.get_max_size_for_path(path);
         if let Some(content_length) = response.content_length() {
-            if content_length > max_size as u64 {
+            if content_length > max_size {
                 return Err(anyhow!(
                     "Content-Length {} exceeds max size {} for {}",
                     content_length,
@@ -250,8 +250,7 @@ impl MirrorFetcher {
                     "Resource not modified (304) for {}, returning cached response",
                     path
                 );
-                let mut warp_response =
-                    warp::reply::Response::new(warp::hyper::Body::empty().into());
+                let mut warp_response = warp::reply::Response::new(warp::hyper::Body::empty());
                 *warp_response.status_mut() = reqwest::StatusCode::NOT_MODIFIED;
                 return Ok(warp_response);
             }

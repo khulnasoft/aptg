@@ -162,11 +162,11 @@ impl GeoPolicyEngine {
                 continue;
             }
 
-            if self.evaluate_condition(&rule.condition, &location) {
-                if rule.priority > highest_priority {
-                    matching_rule = Some(rule);
-                    highest_priority = rule.priority;
-                }
+            if self.evaluate_condition(&rule.condition, &location)
+                && rule.priority > highest_priority
+            {
+                matching_rule = Some(rule);
+                highest_priority = rule.priority;
             }
         }
 
@@ -224,7 +224,7 @@ impl GeoPolicyEngine {
             }
             GeoCondition::RiskScore { min, max } => {
                 let score = location.get_risk_score();
-                min.map_or(true, |m| score >= m) && max.map_or(true, |m| score <= m)
+                min.is_none_or(|m| score >= m) && max.is_none_or(|m| score <= m)
             }
             GeoCondition::Distance {
                 latitude,

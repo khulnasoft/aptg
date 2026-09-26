@@ -170,6 +170,7 @@ async fn handle_metrics(metrics: Arc<MetricsCollector>) -> Result<impl Reply, Re
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_debian_request(
     path_tail: warp::path::Tail,
     method: warp::http::Method,

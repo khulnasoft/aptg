@@ -137,6 +137,12 @@ pub struct PolicyEngine {
     banned_until: HashMap<String, Instant>,
 }
 
+impl Default for PolicyEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PolicyEngine {
     pub fn new() -> Self {
         let config = PolicyConfig::default();
@@ -275,7 +281,7 @@ impl PolicyEngine {
     fn extract_package_name(&self, filename: &str) -> Option<String> {
         if filename.ends_with(".deb") {
             let parts: Vec<&str> = filename.split('_').collect();
-            if parts.len() >= 1 {
+            if !parts.is_empty() {
                 return Some(parts[0].to_string());
             }
         }

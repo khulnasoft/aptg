@@ -1,17 +1,6 @@
 use anyhow::Result;
 use std::net::SocketAddr;
 use tracing::info;
-use tracing_subscriber;
-
-mod audit;
-mod cache;
-mod geoip;
-mod metrics;
-mod mirror;
-mod policy;
-mod server;
-mod tls;
-mod verify;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,7 +8,7 @@ async fn main() -> Result<()> {
 
     info!("Starting aptg");
 
-    let routes = server::router::build_routes();
+    let routes = aptg::server::router::build_routes();
     let addr: SocketAddr = ([0, 0, 0, 0], 8080).into();
 
     info!("Server listening on {}", addr);

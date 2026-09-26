@@ -29,6 +29,7 @@ impl Default for TlsServerConfig {
 
 pub struct TlsServer {
     config: Arc<TlsServerConfig>,
+    #[allow(dead_code)]
     acceptor: TlsAcceptor,
 }
 
@@ -120,7 +121,6 @@ pub fn create_secure_server_config() -> TlsServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn test_tls_server_config_default() {

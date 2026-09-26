@@ -335,7 +335,6 @@ pub struct KeyringInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn test_gpg_verifier_creation() {

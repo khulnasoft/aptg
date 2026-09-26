@@ -162,8 +162,6 @@ impl GeoIpDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn test_database_creation() {
