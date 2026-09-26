@@ -1,7 +1,11 @@
 use crate::mirror::path::{DebianPath, PathParser, PathType};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::runtime::Handle;
+use tokio::sync::RwLock;
 use tracing::info;
 use warp::http::Method;
 
@@ -28,7 +32,9 @@ pub struct DenyPolicy {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LimitsPolicy {
     pub max_deb_size_mb: u64,
-    pub max_request_rate_per_minute: u32,
+    pub max_requests_per_minute_per_ip: u32,
+    pub burst_size: usize,
+    pub ban_duration_seconds: u64,
 }
 
 impl Default for PolicyConfig {
@@ -53,9 +59,69 @@ impl Default for PolicyConfig {
             },
             limits: LimitsPolicy {
                 max_deb_size_mb: 500,
-                max_request_rate_per_minute: 100,
+                max_requests_per_minute_per_ip: 100,
+                burst_size: 20,
+                ban_duration_seconds: 300,
             },
         }
+    }
+}
+
+pub struct RateLimiter {
+    requests: Arc<RwLock<HashMap<String, Vec<Instant>>>>,
+    max_requests_per_minute: u32,
+    burst_size: usize,
+    handle: Handle,
+}
+
+impl RateLimiter {
+    pub fn new(max_requests_per_minute: u32, burst_size: usize) -> Self {
+        let handle = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime")
+            .handle()
+            .clone();
+        Self {
+            requests: Arc::new(RwLock::new(HashMap::new())),
+            max_requests_per_minute,
+            burst_size,
+            handle,
+        }
+    }
+
+    pub async fn check(&self, client_ip: &str) -> Result<()> {
+        let mut requests = self.requests.write().await;
+        let now = Instant::now();
+        let one_minute_ago = now - Duration::from_secs(60);
+
+        let client_requests = requests
+            .entry(client_ip.to_string())
+            .or_insert_with(Vec::new);
+        client_requests.retain(|&t| t > one_minute_ago);
+
+        if client_requests.len() >= self.burst_size {
+            return Err(anyhow!(
+                "Rate limit exceeded for client {}: burst size {} reached",
+                client_ip,
+                self.burst_size
+            ));
+        }
+
+        if client_requests.len() as u32 >= self.max_requests_per_minute {
+            return Err(anyhow!(
+                "Rate limit exceeded for client {}: max {} requests per minute",
+                client_ip,
+                self.max_requests_per_minute
+            ));
+        }
+
+        client_requests.push(now);
+        Ok(())
+    }
+
+    pub fn check_blocking(&self, client_ip: &str) -> Result<()> {
+        self.handle.block_on(self.check(client_ip))
     }
 }
 
@@ -66,6 +132,9 @@ pub struct PolicyEngine {
     allowed_architectures: HashSet<String>,
     denied_architectures: HashSet<String>,
     denied_packages: HashSet<String>,
+    rate_limiter: RateLimiter,
+    banlist: HashSet<String>,
+    banned_until: HashMap<String, Instant>,
 }
 
 impl PolicyEngine {
@@ -83,6 +152,11 @@ impl PolicyEngine {
             config.deny.architectures.iter().cloned().collect();
         let denied_packages: HashSet<String> = config.deny.packages.iter().cloned().collect();
 
+        let rate_limiter = RateLimiter::new(
+            config.limits.max_requests_per_minute_per_ip,
+            config.limits.burst_size,
+        );
+
         Self {
             config,
             allowed_suites,
@@ -90,14 +164,20 @@ impl PolicyEngine {
             allowed_architectures,
             denied_architectures,
             denied_packages,
+            rate_limiter,
+            banlist: HashSet::new(),
+            banned_until: HashMap::new(),
         }
     }
 
-    pub fn check_request(&self, path: &str, method: &Method) -> bool {
+    pub fn check_request(&self, client_ip: &str, path: &str, method: &Method) -> Result<bool> {
+        self.check_banlist(client_ip)?;
+        self.rate_limiter.check_blocking(client_ip)?;
+
         if method != Method::GET && method != Method::HEAD {
-            return false;
+            return Ok(false);
         }
-        self.check_path(path).is_ok()
+        Ok(self.check_path(path).is_ok())
     }
 
     pub fn check_path(&self, path: &str) -> Result<()> {
@@ -112,20 +192,52 @@ impl PolicyEngine {
         }
     }
 
+    pub fn check_rate_limit(&self, client_ip: &str) -> Result<()> {
+        self.rate_limiter.check_blocking(client_ip)
+    }
+
+    pub fn check_banlist(&self, client_ip: &str) -> Result<()> {
+        if self.banlist.contains(client_ip) {
+            if let Some(banned_until) = self.banned_until.get(client_ip) {
+                if Instant::now() < *banned_until {
+                    return Err(anyhow!(
+                        "Client {} is banned until {:?}",
+                        client_ip,
+                        banned_until
+                    ));
+                }
+            }
+            return Err(anyhow!("Client {} is banned", client_ip));
+        }
+        Ok(())
+    }
+
+    pub fn ban_client(&mut self, ip: &str, duration: Duration) {
+        self.banlist.insert(ip.to_string());
+        self.banned_until
+            .insert(ip.to_string(), Instant::now() + duration);
+        self.rate_limiter.requests.blocking_write().remove(ip);
+        info!("Client {} banned for {:?}", ip, duration);
+    }
+
+    pub fn unban_client(&mut self, ip: &str) {
+        self.banlist.remove(ip);
+        self.banned_until.remove(ip);
+        self.rate_limiter.requests.blocking_write().remove(ip);
+        info!("Client {} unbanned", ip);
+    }
+
     fn check_release_policy(&self, path: &DebianPath) -> Result<()> {
-        // Check suite
         if !self.allowed_suites.contains(&path.suite) {
             return Err(anyhow!("Suite '{}' is not allowed", path.suite));
         }
 
-        // Check component if specified
         if let Some(ref component) = path.component {
             if !self.allowed_components.contains(component) {
                 return Err(anyhow!("Component '{}' is not allowed", component));
             }
         }
 
-        // Check architecture if specified
         if let Some(ref arch) = path.architecture {
             if self.denied_architectures.contains(arch) {
                 return Err(anyhow!("Architecture '{}' is explicitly denied", arch));
@@ -135,7 +247,6 @@ impl PolicyEngine {
             }
         }
 
-        // Allow top-level release files (InRelease, Release, Release.gpg)
         if path.component.is_none() {
             return Ok(());
         }
@@ -144,14 +255,12 @@ impl PolicyEngine {
     }
 
     fn check_package_policy(&self, path: &DebianPath) -> Result<()> {
-        // Check component if specified
         if let Some(ref component) = path.component {
             if !self.allowed_components.contains(component) {
                 return Err(anyhow!("Component '{}' is not allowed", component));
             }
         }
 
-        // Check package name if denied
         if let Some(ref filename) = path.filename {
             if let Some(package_name) = self.extract_package_name(filename) {
                 if self.denied_packages.contains(&package_name) {
@@ -164,8 +273,6 @@ impl PolicyEngine {
     }
 
     fn extract_package_name(&self, filename: &str) -> Option<String> {
-        // Extract package name from .deb filename
-        // Example: apt_2.6.1_amd64.deb -> apt
         if filename.ends_with(".deb") {
             let parts: Vec<&str> = filename.split('_').collect();
             if parts.len() >= 1 {
@@ -190,6 +297,11 @@ impl PolicyEngine {
     pub fn load_config_from_file(&mut self, config_path: &str) -> Result<()> {
         let config_content = std::fs::read_to_string(config_path)?;
         let config: PolicyConfig = toml::from_str(&config_content)?;
+
+        self.rate_limiter = RateLimiter::new(
+            config.limits.max_requests_per_minute_per_ip,
+            config.limits.burst_size,
+        );
 
         *self = Self::from_config(config);
         info!("Policy configuration loaded from {}", config_path);
@@ -225,9 +337,8 @@ mod tests {
     #[test]
     fn test_file_size_limit() {
         let engine = PolicyEngine::new();
-        // Default limit is 500MB
-        assert!(engine.check_file_size(100 * 1024 * 1024).is_ok()); // 100MB
-        assert!(engine.check_file_size(600 * 1024 * 1024).is_err()); // 600MB
+        assert!(engine.check_file_size(100 * 1024 * 1024).is_ok());
+        assert!(engine.check_file_size(600 * 1024 * 1024).is_err());
     }
 
     #[test]
@@ -242,5 +353,25 @@ mod tests {
         let engine = PolicyEngine::new();
         let result = engine.check_path("/debian/pool/main/a/apt/apt_2.6.1_amd64.deb");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter() {
+        let limiter = RateLimiter::new(5, 5);
+        assert!(limiter.check_blocking("127.0.0.1").is_ok());
+        assert!(limiter.check_blocking("127.0.0.1").is_ok());
+        assert!(limiter.check_blocking("127.0.0.1").is_ok());
+        assert!(limiter.check_blocking("127.0.0.1").is_ok());
+        assert!(limiter.check_blocking("127.0.0.1").is_ok());
+        assert!(limiter.check_blocking("127.0.0.1").is_err());
+    }
+
+    #[test]
+    fn test_banlist() {
+        let mut engine = PolicyEngine::new();
+        engine.ban_client("192.168.1.1", Duration::from_secs(10));
+        assert!(engine.check_banlist("192.168.1.1").is_err());
+        engine.unban_client("192.168.1.1");
+        assert!(engine.check_banlist("192.168.1.1").is_ok());
     }
 }

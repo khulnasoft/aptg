@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod cache;
 pub mod geoip;
+pub mod metrics;
 pub mod mirror;
 pub mod policy;
 pub mod server;

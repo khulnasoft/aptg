@@ -34,6 +34,10 @@ impl GpgVerifier {
         }
     }
 
+    pub fn keyring_path(&self) -> &str {
+        &self.keyring_path
+    }
+
     pub fn verify_inrelease(&self, inrelease_data: &[u8]) -> Result<GpgVerificationResult> {
         info!("Verifying InRelease file with GPG");
 

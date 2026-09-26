@@ -1,9 +1,11 @@
 use crate::audit::log::AuditLogger;
 use crate::cache::cache::CacheManager;
 use crate::geoip::policy::{GeoPolicy, GeoPolicyEngine};
+use crate::metrics::MetricsCollector;
 use crate::mirror::fetch::MirrorFetcher;
 use crate::policy::rules::PolicyEngine;
 use crate::verify::gpg::GpgVerifier;
+use std::path::Path;
 use std::sync::Arc;
 use warp::{Filter, Rejection, Reply};
 
@@ -43,17 +45,23 @@ fn with_geo_policy<T: Clone + Send + Sync>(
     warp::any().map(move || item.clone())
 }
 
+fn with_metrics<T: Clone + Send + Sync>(
+    item: T,
+) -> impl Filter<Extract = (T,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || item.clone())
+}
+
 pub fn build_routes() -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
-    let fetcher = Arc::new(MirrorFetcher::new());
+    let fetcher = Arc::new(MirrorFetcher::new_with_default());
     let policy = Arc::new(PolicyEngine::new());
     let cache = Arc::new(CacheManager::new());
     let audit = Arc::new(AuditLogger::new());
     let gpg_verifier = Arc::new(GpgVerifier::new("/etc/debian-archive-keyring.gpg"));
-
     let geo_policy = GeoPolicy::default();
     let geo_policy_engine = Arc::new(GeoPolicyEngine::new(geo_policy));
+    let metrics = Arc::new(MetricsCollector::new());
 
-    warp::path("debian")
+    let mirror_routes = warp::path("debian")
         .and(warp::path::tail())
         .and(warp::method())
         .and(warp::header::headers_cloned())
@@ -64,7 +72,102 @@ pub fn build_routes() -> impl Filter<Extract = impl Reply, Error = Rejection> + 
         .and(with_audit(audit.clone()))
         .and(with_gpg_verifier(gpg_verifier.clone()))
         .and(with_geo_policy(geo_policy_engine.clone()))
-        .and_then(handle_debian_request)
+        .and_then(handle_debian_request);
+
+    let health_routes = build_health_routes(
+        cache.clone(),
+        fetcher.clone(),
+        gpg_verifier.clone(),
+        metrics.clone(),
+    );
+
+    mirror_routes.or(health_routes)
+}
+
+pub fn build_health_routes(
+    cache: Arc<CacheManager>,
+    fetcher: Arc<MirrorFetcher>,
+    gpg_verifier: Arc<GpgVerifier>,
+    metrics: Arc<MetricsCollector>,
+) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
+    let health = warp::path("healthz")
+        .and(warp::get())
+        .and(with_metrics(metrics.clone()))
+        .and_then(handle_health);
+
+    let ready = warp::path("readyz")
+        .and(warp::get())
+        .and(with_cache(cache.clone()))
+        .and(with_fetcher(fetcher.clone()))
+        .and(with_gpg_verifier(gpg_verifier.clone()))
+        .and(with_metrics(metrics.clone()))
+        .and_then(handle_ready);
+
+    let prometheus = warp::path("metrics")
+        .and(warp::get())
+        .and(with_metrics(metrics.clone()))
+        .and_then(handle_metrics);
+
+    health.or(ready).or(prometheus)
+}
+
+async fn handle_health(metrics: Arc<MetricsCollector>) -> Result<impl Reply, Rejection> {
+    metrics.increment_total_requests().await;
+    Ok(warp::reply::with_status(
+        warp::reply::json(&serde_json::json!({
+            "status": "ok",
+            "service": "aptg"
+        })),
+        warp::http::StatusCode::OK,
+    ))
+}
+
+async fn handle_ready(
+    _cache: Arc<CacheManager>,
+    fetcher: Arc<MirrorFetcher>,
+    gpg_verifier: Arc<GpgVerifier>,
+    metrics: Arc<MetricsCollector>,
+) -> Result<impl Reply, Rejection> {
+    metrics.increment_total_requests().await;
+
+    let cache_ok = true;
+    let fetcher_ok = fetcher.is_ready();
+    let keyring_ok = Path::new(gpg_verifier.keyring_path()).exists()
+        || std::path::Path::new("/etc/debian-archive-keyring.gpg").exists();
+
+    if cache_ok && fetcher_ok && keyring_ok {
+        Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({
+                "status": "ready",
+                "dependencies": {
+                    "cache": true,
+                    "fetcher": fetcher_ok,
+                    "keyring": keyring_ok
+                }
+            })),
+            warp::http::StatusCode::OK,
+        ))
+    } else {
+        Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({
+                "status": "not_ready",
+                "dependencies": {
+                    "cache": cache_ok,
+                    "fetcher": fetcher_ok,
+                    "keyring": keyring_ok
+                }
+            })),
+            warp::http::StatusCode::SERVICE_UNAVAILABLE,
+        ))
+    }
+}
+
+async fn handle_metrics(metrics: Arc<MetricsCollector>) -> Result<impl Reply, Rejection> {
+    let output = metrics.prometheus_output().await;
+    Ok(warp::reply::with_status(
+        warp::reply::Response::new(output.into()),
+        warp::http::StatusCode::OK,
+    ))
 }
 
 async fn handle_debian_request(
@@ -93,7 +196,11 @@ async fn handle_debian_request(
         )));
     }
 
-    if !policy.check_request(&path, &method) {
+    let allowed = match &client_ip {
+        Some(ip) => policy.check_request(ip, &path, &method).unwrap_or(false),
+        None => false,
+    };
+    if !allowed {
         audit.log_request(&method, &path, &headers).await;
         return Ok(Box::new(warp::reply::with_status(
             warp::reply::json(&serde_json::json!({"error": "Access denied by policy"})),
@@ -144,11 +251,11 @@ async fn handle_debian_request(
     match fetcher.fetch(&path).await {
         Ok(response) => {
             audit.log_fetch_success(&path).await;
-            cache.store(&path, &response).await;
-
             let path_str = path.as_str();
+            let response_bytes = extract_response_bytes(response);
+            let cached_response = warp::reply::Response::new(response_bytes.clone().into());
+            cache.store(&path, cached_response).await;
             if path_str.ends_with("InRelease") || path_str.ends_with("Release") {
-                let response_bytes = extract_response_bytes(&response);
                 if let Ok(verification_result) = gpg_verifier.verify_inrelease(&response_bytes) {
                     if verification_result.valid {
                         audit.log_verification_success(&path).await;
@@ -168,7 +275,9 @@ async fn handle_debian_request(
                 }
             }
 
-            Ok(Box::new(response))
+            let mut warp_response = warp::reply::Response::new(response_bytes.into());
+            *warp_response.status_mut() = warp::http::StatusCode::OK;
+            Ok(Box::new(warp_response))
         }
         Err(e) => {
             audit.log_fetch_error(&path, &e).await;
@@ -199,6 +308,11 @@ fn extract_client_ip(
     None
 }
 
-fn extract_response_bytes(_response: &impl Reply) -> Vec<u8> {
-    vec![]
+fn extract_response_bytes(response: impl Reply) -> Vec<u8> {
+    let resp = response.into_response();
+    let body = resp.into_body();
+    let bytes = tokio::runtime::Handle::current()
+        .block_on(hyper::body::to_bytes(body))
+        .unwrap_or_default();
+    bytes.to_vec()
 }

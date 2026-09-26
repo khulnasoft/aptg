@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
 use tracing::{error, info};
 
@@ -25,6 +25,34 @@ impl HashVerifier {
         }
     }
 
+    pub fn verify_package_hash_sha512(data: &[u8], expected_hash: &str) -> Result<bool> {
+        info!("Verifying SHA512 hash for package data");
+
+        let mut hasher = Sha512::new();
+        hasher.update(data);
+        let calculated_hash = format!("{:x}", hasher.finalize());
+
+        if calculated_hash == expected_hash {
+            info!("Hash verification successful");
+            Ok(true)
+        } else {
+            error!(
+                "Hash mismatch: expected {}, got {}",
+                expected_hash, calculated_hash
+            );
+            Err(anyhow!("SHA512 hash verification failed"))
+        }
+    }
+
+    pub fn verify_hash(data: &[u8], expected_hash: &str) -> Result<bool> {
+        let hash_len = expected_hash.len();
+        if hash_len == 128 {
+            Self::verify_package_hash_sha512(data, expected_hash)
+        } else {
+            Self::verify_package_hash(data, expected_hash)
+        }
+    }
+
     pub fn parse_release_hashes(release_content: &str) -> Result<HashMap<String, String>> {
         info!("Parsing hashes from Release file");
 
@@ -37,13 +65,17 @@ impl HashVerifier {
                 continue;
             }
 
+            if line.starts_with("SHA512:") {
+                in_hashes_section = true;
+                continue;
+            }
+
             if line.is_empty() || line.starts_with("MD5Sum:") || line.starts_with("SHA1:") {
                 in_hashes_section = false;
                 continue;
             }
 
             if in_hashes_section {
-                // SHA256 format: hash size filename
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 3 {
                     let hash = parts[0].to_string();
@@ -63,7 +95,7 @@ impl HashVerifier {
         release_hashes: &HashMap<String, String>,
     ) -> Result<bool> {
         if let Some(expected_hash) = release_hashes.get(filename) {
-            Self::verify_package_hash(file_data, expected_hash)
+            Self::verify_hash(file_data, expected_hash)
         } else {
             Err(anyhow!("No hash found for file: {}", filename))
         }
@@ -77,9 +109,8 @@ mod tests {
     #[test]
     fn test_hash_verification() {
         let data = b"test data";
-        let hash = "916f0023a0d5e5904614e65e77b3818a6d5e7e1a5b5c5e5e5e5e5e5e5e5e5e5e5";
+        let hash = "916f0023a0d5e5904614e65e77b3818a6d5e7e1a5b5c5e5e5e5e5e5e5e5e5e5";
 
-        // This will fail since we're using fake hash, but tests the structure
         let result = HashVerifier::verify_package_hash(data, hash);
         assert!(result.is_err());
     }
@@ -97,6 +128,10 @@ def456 2048 main/binary-amd64/Packages.gz
         assert_eq!(
             hashes.get("main/binary-amd64/Packages"),
             Some(&"abc123".to_string())
+        );
+        assert_eq!(
+            hashes.get("main/binary-amd64/Packages.gz"),
+            Some(&"def456".to_string())
         );
     }
 }

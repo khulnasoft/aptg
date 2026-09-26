@@ -6,6 +6,7 @@ use tracing_subscriber;
 mod audit;
 mod cache;
 mod geoip;
+mod metrics;
 mod mirror;
 mod policy;
 mod server;

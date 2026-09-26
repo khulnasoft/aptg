@@ -1,5 +1,7 @@
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -8,6 +10,7 @@ use warp::Reply;
 pub struct CacheManager {
     cache: RwLock<HashMap<String, CacheEntry>>,
     ttl_config: TtlConfig,
+    disk_cache_dir: Option<String>,
 }
 
 #[derive(Clone)]
@@ -34,9 +37,9 @@ pub struct TtlConfig {
 impl Default for TtlConfig {
     fn default() -> Self {
         Self {
-            release_ttl: Duration::from_secs(6 * 3600),    // 6 hours
-            packages_ttl: Duration::from_secs(12 * 3600),  // 12 hours
-            deb_ttl: Duration::from_secs(365 * 24 * 3600), // 1 year (effectively forever)
+            release_ttl: Duration::from_secs(6 * 3600),
+            packages_ttl: Duration::from_secs(12 * 3600),
+            deb_ttl: Duration::from_secs(365 * 24 * 3600),
         }
     }
 }
@@ -46,6 +49,7 @@ impl CacheManager {
         Self {
             cache: RwLock::new(HashMap::new()),
             ttl_config: TtlConfig::default(),
+            disk_cache_dir: None,
         }
     }
 
@@ -55,17 +59,7 @@ impl CacheManager {
         if let Some(entry) = cache.get(path) {
             if entry.created_at.elapsed() < entry.ttl {
                 info!("Cache hit for: {}", path);
-
-                let _response = warp::reply::Response::new(entry.data.body.clone().into());
-
-                // Copy headers and status
-                let reply = CachedResponse {
-                    status: entry.data.status,
-                    headers: entry.data.headers.clone(),
-                    body: entry.data.body.clone(),
-                };
-
-                return Some(self.create_warp_response(reply));
+                return Some(self.create_warp_response(entry.data.clone()));
             } else {
                 warn!("Cache expired for: {}", path);
             }
@@ -74,12 +68,34 @@ impl CacheManager {
         None
     }
 
-    pub async fn store(&self, path: &str, _response: &impl Reply) {
+    pub async fn store(&self, path: &str, response: impl Reply) {
         let ttl = self.determine_ttl(path);
 
-        // For now, we'll skip caching since we can't properly extract response data
-        // In a real implementation, you'd need to properly extract the response data
-        info!("Skipping cache storage for: {} (TTL: {:?})", path, ttl);
+        match self.extract_response_data(response).await {
+            Ok(cached_response) => {
+                let entry = CacheEntry {
+                    data: cached_response.clone(),
+                    created_at: Instant::now(),
+                    ttl,
+                };
+
+                let mut cache = self.cache.write().await;
+                cache.insert(path.to_string(), entry);
+                info!("Cached response for: {} (TTL: {:?})", path, ttl);
+
+                if let Some(ref disk_dir) = self.disk_cache_dir {
+                    if let Err(e) = self
+                        .store_to_disk(path, &cached_response, disk_dir.as_str())
+                        .await
+                    {
+                        warn!("Failed to store cache to disk for {}: {}", path, e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to extract response data for {}: {}", path, e);
+            }
+        }
     }
 
     fn determine_ttl(&self, path: &str) -> Duration {
@@ -90,21 +106,22 @@ impl CacheManager {
         } else if path.ends_with(".deb") {
             self.ttl_config.deb_ttl
         } else {
-            Duration::from_secs(3600) // Default 1 hour
+            Duration::from_secs(3600)
         }
     }
 
     async fn extract_response_data(
         &self,
-        _response: &impl Reply,
+        response: impl Reply,
     ) -> Result<CachedResponse, Box<dyn std::error::Error + Send + Sync>> {
-        // This is a simplified version - in practice, you'd need to properly extract
-        // the response data from the warp Reply
-        // For now, we'll create a placeholder
+        let resp = response.into_response();
+        let status = resp.status().clone();
+        let headers = resp.headers().clone();
+        let body = hyper::body::to_bytes(resp.into_body()).await?;
         Ok(CachedResponse {
-            status: warp::http::StatusCode::OK,
-            headers: warp::http::HeaderMap::new(),
-            body: Bytes::new(),
+            status,
+            headers,
+            body,
         })
     }
 
@@ -115,22 +132,108 @@ impl CacheManager {
         response
     }
 
+    async fn store_to_disk(
+        &self,
+        path: &str,
+        data: &CachedResponse,
+        dir: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let safe_path = path.replace('/', "_").replace('\\', "_");
+        let dir = PathBuf::from(dir);
+        fs::create_dir_all(&dir)?;
+        let file_path = dir.join(format!("{}.cache", safe_path));
+        let mut file = fs::File::create(&file_path)?;
+        use std::io::Write;
+        file.write_all(&data.body)?;
+        info!("Stored disk cache for: {} at {}", path, file_path.display());
+        Ok(())
+    }
+
+    fn load_from_disk(&self, path: &str, dir: &str) -> Option<CachedResponse> {
+        let safe_path = path.replace('/', "_").replace('\\', "_");
+        let file_path = PathBuf::from(dir).join(format!("{}.cache", safe_path));
+        if file_path.exists() {
+            let body = fs::read(&file_path).ok()?;
+            Some(CachedResponse {
+                status: warp::http::StatusCode::OK,
+                headers: warp::http::HeaderMap::new(),
+                body: Bytes::from(body),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn disk_cache_file_path(&self, path: &str, dir: &str) -> PathBuf {
+        let safe_path = path.replace('/', "_").replace('\\', "_");
+        PathBuf::from(dir).join(format!("{}.cache", safe_path))
+    }
+
     pub async fn clear(&self) {
         let mut cache = self.cache.write().await;
         cache.clear();
         info!("Cache cleared");
+
+        if let Some(ref disk_dir) = self.disk_cache_dir {
+            let dir = PathBuf::from(disk_dir.as_str());
+            if dir.exists() {
+                let _ = fs::remove_dir_all(&dir);
+                info!("Disk cache directory cleared: {}", dir.display());
+            }
+        }
     }
 
     pub async fn cleanup_expired(&self) {
         let mut cache = self.cache.write().await;
         let now = Instant::now();
 
-        cache.retain(|path, entry| {
-            let is_valid = now.duration_since(entry.created_at) < entry.ttl;
-            if !is_valid {
+        let expired_paths: Vec<String> = cache
+            .iter()
+            .filter(|(_, entry)| now.duration_since(entry.created_at) >= entry.ttl)
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        for path in &expired_paths {
+            if let Some(_entry) = cache.remove(path) {
                 info!("Removing expired cache entry: {}", path);
+
+                if let Some(ref disk_dir) = self.disk_cache_dir {
+                    let file_path = self.disk_cache_file_path(path, disk_dir.as_str());
+                    if file_path.exists() {
+                        let _ = fs::remove_file(&file_path);
+                        info!("Removed expired disk cache file for: {}", path);
+                    }
+                }
             }
-            is_valid
-        });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_manager_creation() {
+        let cache = CacheManager::new();
+        assert!(cache.disk_cache_dir.is_none());
+    }
+
+    #[test]
+    fn test_determine_ttl() {
+        let cache = CacheManager::new();
+        assert_eq!(
+            cache.determine_ttl("/dists/stable/InRelease"),
+            Duration::from_secs(6 * 3600)
+        );
+        assert_eq!(
+            cache.determine_ttl("/dists/stable/main/binary-amd64/Packages"),
+            Duration::from_secs(12 * 3600)
+        );
+        assert_eq!(
+            cache.determine_ttl("/pool/main/pkg/pkg_1.0.deb"),
+            Duration::from_secs(365 * 24 * 3600)
+        );
+        assert_eq!(cache.determine_ttl("/some/path"), Duration::from_secs(3600));
     }
 }
