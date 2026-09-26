@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
-use warp::Reply;
 
 pub struct CacheManager {
     cache: RwLock<HashMap<String, CacheEntry>>,
@@ -25,6 +24,16 @@ pub struct CachedResponse {
     pub status: warp::http::StatusCode,
     pub headers: warp::http::HeaderMap,
     pub body: Bytes,
+}
+
+impl CachedResponse {
+    /// Rebuild a reply that preserves the original upstream status and headers.
+    pub fn into_reply(self) -> warp::reply::Response {
+        let mut response = warp::reply::Response::new(self.body.into());
+        *response.headers_mut() = self.headers;
+        *response.status_mut() = self.status;
+        response
+    }
 }
 
 #[derive(Clone)]
@@ -52,20 +61,31 @@ impl Default for CacheManager {
 
 impl CacheManager {
     pub fn new() -> Self {
+        Self::new_with_disk_cache("")
+    }
+
+    /// Create a cache that also persists bodies under `dir`.
+    ///
+    /// An empty `dir` disables disk caching.
+    pub fn new_with_disk_cache(dir: &str) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
             ttl_config: TtlConfig::default(),
-            disk_cache_dir: None,
+            disk_cache_dir: if dir.is_empty() {
+                None
+            } else {
+                Some(dir.to_string())
+            },
         }
     }
 
-    pub async fn get(&self, path: &str) -> Option<impl Reply> {
+    pub async fn get(&self, path: &str) -> Option<CachedResponse> {
         let cache = self.cache.read().await;
 
         if let Some(entry) = cache.get(path) {
             if entry.created_at.elapsed() < entry.ttl {
                 info!("Cache hit for: {}", path);
-                return Some(self.create_warp_response(entry.data.clone()));
+                return Some(entry.data.clone());
             } else {
                 warn!("Cache expired for: {}", path);
             }
@@ -74,33 +94,55 @@ impl CacheManager {
         None
     }
 
-    pub async fn store(&self, path: &str, response: impl Reply) {
+    pub async fn store(&self, path: &str, data: CachedResponse) {
         let ttl = self.determine_ttl(path);
 
-        match self.extract_response_data(response).await {
-            Ok(cached_response) => {
-                let entry = CacheEntry {
-                    data: cached_response.clone(),
-                    created_at: Instant::now(),
-                    ttl,
-                };
+        let entry = CacheEntry {
+            data: data.clone(),
+            created_at: Instant::now(),
+            ttl,
+        };
 
-                let mut cache = self.cache.write().await;
-                cache.insert(path.to_string(), entry);
-                info!("Cached response for: {} (TTL: {:?})", path, ttl);
+        let mut cache = self.cache.write().await;
+        cache.insert(path.to_string(), entry);
+        info!("Cached response for: {} (TTL: {:?})", path, ttl);
 
-                if let Some(ref disk_dir) = self.disk_cache_dir {
-                    if let Err(e) = self
-                        .store_to_disk(path, &cached_response, disk_dir.as_str())
-                        .await
-                    {
-                        warn!("Failed to store cache to disk for {}: {}", path, e);
+        if let Some(ref disk_dir) = self.disk_cache_dir {
+            if let Err(e) = self.store_to_disk(path, &data, disk_dir.as_str()).await {
+                warn!("Failed to store cache to disk for {}: {}", path, e);
+            }
+        }
+    }
+
+    /// Report whether the cache is usable.
+    ///
+    /// Verifies the in-memory store can be locked and, when a disk cache
+    /// directory is configured, that the directory is present and writable.
+    pub async fn is_ready(&self) -> bool {
+        // Acquire and release the read lock to confirm the store is usable.
+        {
+            let _guard = self.cache.read().await;
+        }
+
+        match &self.disk_cache_dir {
+            Some(dir) => {
+                let path = PathBuf::from(dir);
+                if !path.is_dir() {
+                    return false;
+                }
+                let probe = path.join(".aptg-readiness-probe");
+                match fs::File::create(&probe) {
+                    Ok(_) => {
+                        let _ = fs::remove_file(&probe);
+                        true
+                    }
+                    Err(e) => {
+                        warn!("Cache disk directory not writable: {}", e);
+                        false
                     }
                 }
             }
-            Err(e) => {
-                warn!("Failed to extract response data for {}: {}", path, e);
-            }
+            None => true,
         }
     }
 
@@ -114,28 +156,6 @@ impl CacheManager {
         } else {
             Duration::from_secs(3600)
         }
-    }
-
-    async fn extract_response_data(
-        &self,
-        response: impl Reply,
-    ) -> Result<CachedResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let resp = response.into_response();
-        let status = resp.status();
-        let headers = resp.headers().clone();
-        let body = hyper::body::to_bytes(resp.into_body()).await?;
-        Ok(CachedResponse {
-            status,
-            headers,
-            body,
-        })
-    }
-
-    fn create_warp_response(&self, cached: CachedResponse) -> impl Reply {
-        let mut response = warp::reply::Response::new(cached.body.into());
-        *response.headers_mut() = cached.headers;
-        *response.status_mut() = cached.status;
-        response
     }
 
     async fn store_to_disk(
@@ -226,5 +246,84 @@ mod tests {
             Duration::from_secs(365 * 24 * 3600)
         );
         assert_eq!(cache.determine_ttl("/some/path"), Duration::from_secs(3600));
+    }
+
+    fn sample() -> CachedResponse {
+        let mut headers = warp::http::HeaderMap::new();
+        headers.insert(
+            warp::http::header::CONTENT_TYPE,
+            warp::http::HeaderValue::from_static("application/octet-stream"),
+        );
+        CachedResponse {
+            status: warp::http::StatusCode::PARTIAL_CONTENT,
+            headers,
+            body: Bytes::from_static(b"package-bytes"),
+        }
+    }
+
+    const PATH: &str = "/debian/dists/stable/InRelease";
+
+    #[tokio::test]
+    async fn cache_round_trip_preserves_status_headers_and_body() {
+        let cache = CacheManager::new();
+        cache.store(PATH, sample()).await;
+
+        let cached = cache.get(PATH).await.expect("expected cache hit");
+        assert_eq!(cached.status, warp::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            cached
+                .headers
+                .get(warp::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(&cached.body[..], b"package-bytes");
+    }
+
+    #[tokio::test]
+    async fn cache_miss_for_unknown_path() {
+        let cache = CacheManager::new();
+        assert!(cache.get("/debian/never-stored.deb").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn into_reply_keeps_original_status() {
+        let reply = sample().into_reply();
+        assert_eq!(reply.status(), warp::http::StatusCode::PARTIAL_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn clear_and_cleanup_remove_entries() {
+        let cache = CacheManager::new();
+        cache.store("/debian/a.deb", sample()).await;
+        assert!(cache.get("/debian/a.deb").await.is_some());
+
+        cache.clear().await;
+        assert!(cache.get("/debian/a.deb").await.is_none());
+
+        cache.store("/debian/b.deb", sample()).await;
+        cache.cleanup_expired().await;
+        assert!(cache.get("/debian/b.deb").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn is_ready_without_disk_cache() {
+        let cache = CacheManager::new();
+        assert!(cache.is_ready().await);
+    }
+
+    #[tokio::test]
+    async fn is_ready_reports_unwritable_disk_dir() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("does-not-exist");
+        let cache = CacheManager::new_with_disk_cache(missing.to_str().unwrap());
+        assert!(!cache.is_ready().await);
+    }
+
+    #[tokio::test]
+    async fn is_ready_with_writable_disk_dir() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = CacheManager::new_with_disk_cache(dir.path().to_str().unwrap());
+        assert!(cache.is_ready().await);
     }
 }

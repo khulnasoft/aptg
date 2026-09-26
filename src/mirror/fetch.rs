@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
-use reqwest::{Client, Response};
+use bytes::Bytes;
+use reqwest::{header::HeaderMap, Client, Response, StatusCode};
 use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
-use warp::Reply;
+use warp::http::Response as HttpResponse;
+use warp::hyper::Body;
 
 use crate::verify::hashes::HashVerifier;
 
@@ -18,6 +20,26 @@ const MAX_SIZE_DEFAULT: u64 = 50 * 1024 * 1024;
 
 const BASE_DELAY_MS: u64 = 100;
 const MAX_RETRIES: u32 = 3;
+
+/// An upstream response captured as plain data.
+///
+/// Fetching returns this instead of an opaque `Reply` so that callers can
+/// inspect the body (for GPG and hash verification) and persist the exact
+/// status and headers without having to re-read an already-consumed body.
+pub struct FetchedResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+}
+
+impl FetchedResponse {
+    pub fn into_http_response(self) -> HttpResponse<Body> {
+        let mut response = HttpResponse::new(Body::from(self.body));
+        *response.status_mut() = self.status;
+        *response.headers_mut() = self.headers;
+        response
+    }
+}
 
 pub struct MirrorFetcher {
     client: Client,
@@ -172,7 +194,7 @@ impl MirrorFetcher {
         Ok(())
     }
 
-    pub async fn fetch(&self, path: &str) -> Result<impl Reply> {
+    pub async fn fetch(&self, path: &str) -> Result<FetchedResponse> {
         let _timeout = self.get_timeout_for_path(path);
         let _max_size = self.get_max_size_for_path(path);
 
@@ -214,18 +236,20 @@ impl MirrorFetcher {
                 continue;
             }
 
-            let mut warp_response = warp::reply::Response::new(bytes.into());
-            *warp_response.headers_mut() = headers;
-            *warp_response.status_mut() = status;
+            let fetched = FetchedResponse {
+                status,
+                headers,
+                body: bytes,
+            };
 
             info!("Successfully fetched {}{} from {}", file_name, path, url);
-            return Ok(warp_response);
+            return Ok(fetched);
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("All upstreams failed for {}", path)))
     }
 
-    pub async fn fetch_with_etag(&self, path: &str, etag: &str) -> Result<impl Reply> {
+    pub async fn fetch_with_etag(&self, path: &str, etag: &str) -> Result<FetchedResponse> {
         info!("Fetching with ETag for path: {}, etag: {}", path, etag);
 
         let _timeout = self.get_timeout_for_path(path);
@@ -250,9 +274,11 @@ impl MirrorFetcher {
                     "Resource not modified (304) for {}, returning cached response",
                     path
                 );
-                let mut warp_response = warp::reply::Response::new(warp::hyper::Body::empty());
-                *warp_response.status_mut() = reqwest::StatusCode::NOT_MODIFIED;
-                return Ok(warp_response);
+                return Ok(FetchedResponse {
+                    status: reqwest::StatusCode::NOT_MODIFIED,
+                    headers: HeaderMap::new(),
+                    body: Bytes::new(),
+                });
             }
 
             if !response.status().is_success() {
@@ -283,17 +309,17 @@ impl MirrorFetcher {
                 continue;
             }
 
-            let mut warp_response = warp::reply::Response::new(bytes.into());
-            *warp_response.headers_mut() = headers;
-            *warp_response.status_mut() = status;
-
-            return Ok(warp_response);
+            return Ok(FetchedResponse {
+                status,
+                headers,
+                body: bytes,
+            });
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("All upstreams failed for {}", path)))
     }
 
-    pub async fn fetch_with_hash_validation(&self, path: &str) -> Result<impl Reply> {
+    pub async fn fetch_with_hash_validation(&self, path: &str) -> Result<FetchedResponse> {
         let file_name = self.get_file_name(path);
         let release_path = path.replace(file_name.as_str(), "Release");
 
@@ -370,11 +396,11 @@ impl MirrorFetcher {
 
             info!("Hash validation successful for {} from {}", file_name, url);
 
-            let mut warp_response = warp::reply::Response::new(bytes.into());
-            *warp_response.headers_mut() = headers;
-            *warp_response.status_mut() = status;
-
-            return Ok(warp_response);
+            return Ok(FetchedResponse {
+                status,
+                headers,
+                body: bytes.into(),
+            });
         }
 
         Err(last_error.unwrap_or_else(|| {

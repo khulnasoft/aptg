@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tracing::info;
 use warp::http::Method;
@@ -71,25 +70,23 @@ pub struct RateLimiter {
     requests: Arc<RwLock<HashMap<String, Vec<Instant>>>>,
     max_requests_per_minute: u32,
     burst_size: usize,
-    handle: Handle,
 }
 
 impl RateLimiter {
     pub fn new(max_requests_per_minute: u32, burst_size: usize) -> Self {
-        let handle = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime")
-            .handle()
-            .clone();
         Self {
             requests: Arc::new(RwLock::new(HashMap::new())),
             max_requests_per_minute,
             burst_size,
-            handle,
         }
     }
 
+    /// Record a request for `client_ip`, failing once it exceeds the burst or
+    /// per-minute limit.
+    ///
+    /// This is async and must be awaited from async context. It previously
+    /// offered a `check_blocking` helper backed by a private runtime, which
+    /// panicked when reached from inside the request handler.
     pub async fn check(&self, client_ip: &str) -> Result<()> {
         let mut requests = self.requests.write().await;
         let now = Instant::now();
@@ -118,10 +115,6 @@ impl RateLimiter {
 
         client_requests.push(now);
         Ok(())
-    }
-
-    pub fn check_blocking(&self, client_ip: &str) -> Result<()> {
-        self.handle.block_on(self.check(client_ip))
     }
 }
 
@@ -176,9 +169,14 @@ impl PolicyEngine {
         }
     }
 
-    pub fn check_request(&self, client_ip: &str, path: &str, method: &Method) -> Result<bool> {
+    pub async fn check_request(
+        &self,
+        client_ip: &str,
+        path: &str,
+        method: &Method,
+    ) -> Result<bool> {
         self.check_banlist(client_ip)?;
-        self.rate_limiter.check_blocking(client_ip)?;
+        self.rate_limiter.check(client_ip).await?;
 
         if method != Method::GET && method != Method::HEAD {
             return Ok(false);
@@ -198,8 +196,8 @@ impl PolicyEngine {
         }
     }
 
-    pub fn check_rate_limit(&self, client_ip: &str) -> Result<()> {
-        self.rate_limiter.check_blocking(client_ip)
+    pub async fn check_rate_limit(&self, client_ip: &str) -> Result<()> {
+        self.rate_limiter.check(client_ip).await
     }
 
     pub fn check_banlist(&self, client_ip: &str) -> Result<()> {
@@ -218,18 +216,18 @@ impl PolicyEngine {
         Ok(())
     }
 
-    pub fn ban_client(&mut self, ip: &str, duration: Duration) {
+    pub async fn ban_client(&mut self, ip: &str, duration: Duration) {
         self.banlist.insert(ip.to_string());
         self.banned_until
             .insert(ip.to_string(), Instant::now() + duration);
-        self.rate_limiter.requests.blocking_write().remove(ip);
+        self.rate_limiter.requests.write().await.remove(ip);
         info!("Client {} banned for {:?}", ip, duration);
     }
 
-    pub fn unban_client(&mut self, ip: &str) {
+    pub async fn unban_client(&mut self, ip: &str) {
         self.banlist.remove(ip);
         self.banned_until.remove(ip);
-        self.rate_limiter.requests.blocking_write().remove(ip);
+        self.rate_limiter.requests.write().await.remove(ip);
         info!("Client {} unbanned", ip);
     }
 
@@ -361,23 +359,63 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_rate_limiter() {
+    #[tokio::test]
+    async fn test_rate_limiter() {
         let limiter = RateLimiter::new(5, 5);
-        assert!(limiter.check_blocking("127.0.0.1").is_ok());
-        assert!(limiter.check_blocking("127.0.0.1").is_ok());
-        assert!(limiter.check_blocking("127.0.0.1").is_ok());
-        assert!(limiter.check_blocking("127.0.0.1").is_ok());
-        assert!(limiter.check_blocking("127.0.0.1").is_ok());
-        assert!(limiter.check_blocking("127.0.0.1").is_err());
+        assert!(limiter.check("127.0.0.1").await.is_ok());
+        assert!(limiter.check("127.0.0.1").await.is_ok());
+        assert!(limiter.check("127.0.0.1").await.is_ok());
+        assert!(limiter.check("127.0.0.1").await.is_ok());
+        assert!(limiter.check("127.0.0.1").await.is_ok());
+        assert!(limiter.check("127.0.0.1").await.is_err());
     }
 
-    #[test]
-    fn test_banlist() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_request_works_inside_a_runtime() {
+        let engine = PolicyEngine::new();
+        let allowed = engine
+            .check_request(
+                "203.0.113.5",
+                "/debian/pool/main/a/apt/apt_2.6.1_amd64.deb",
+                &warp::http::Method::GET,
+            )
+            .await
+            .expect("policy check must not panic inside a runtime");
+        assert!(allowed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_request_rejects_non_get_methods() {
+        let engine = PolicyEngine::new();
+        let allowed = engine
+            .check_request(
+                "203.0.113.6",
+                "/debian/pool/main/a/apt/apt_2.6.1_amd64.deb",
+                &warp::http::Method::POST,
+            )
+            .await
+            .expect("policy check must not panic inside a runtime");
+        assert!(!allowed);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_is_per_client() {
+        let limiter = RateLimiter::new(2, 2);
+        assert!(limiter.check("198.51.100.1").await.is_ok());
+        assert!(limiter.check("198.51.100.1").await.is_ok());
+        assert!(limiter.check("198.51.100.1").await.is_err());
+        // A different client must not be affected by the first one's usage.
+        assert!(limiter.check("198.51.100.2").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_banlist() {
         let mut engine = PolicyEngine::new();
-        engine.ban_client("192.168.1.1", Duration::from_secs(10));
+        engine
+            .ban_client("192.168.1.1", Duration::from_secs(10))
+            .await;
         assert!(engine.check_banlist("192.168.1.1").is_err());
-        engine.unban_client("192.168.1.1");
+        engine.unban_client("192.168.1.1").await;
         assert!(engine.check_banlist("192.168.1.1").is_ok());
     }
 }

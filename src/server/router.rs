@@ -1,5 +1,5 @@
 use crate::audit::log::AuditLogger;
-use crate::cache::cache::CacheManager;
+use crate::cache::cache::{CacheManager, CachedResponse};
 use crate::geoip::policy::{GeoPolicy, GeoPolicyEngine};
 use crate::metrics::MetricsCollector;
 use crate::mirror::fetch::MirrorFetcher;
@@ -123,14 +123,14 @@ async fn handle_health(metrics: Arc<MetricsCollector>) -> Result<impl Reply, Rej
 }
 
 async fn handle_ready(
-    _cache: Arc<CacheManager>,
+    cache: Arc<CacheManager>,
     fetcher: Arc<MirrorFetcher>,
     gpg_verifier: Arc<GpgVerifier>,
     metrics: Arc<MetricsCollector>,
 ) -> Result<impl Reply, Rejection> {
     metrics.increment_total_requests().await;
 
-    let cache_ok = true;
+    let cache_ok = cache.is_ready().await;
     let fetcher_ok = fetcher.is_ready();
     let keyring_ok = Path::new(gpg_verifier.keyring_path()).exists()
         || std::path::Path::new("/etc/debian-archive-keyring.gpg").exists();
@@ -140,7 +140,7 @@ async fn handle_ready(
             warp::reply::json(&serde_json::json!({
                 "status": "ready",
                 "dependencies": {
-                    "cache": true,
+                    "cache": cache_ok,
                     "fetcher": fetcher_ok,
                     "keyring": keyring_ok
                 }
@@ -189,20 +189,23 @@ async fn handle_debian_request(
 
     audit.log_request(&method, &path, &headers).await;
 
-    if let Some(_cached_response) = cache.get(&path).await {
+    if let Some(cached) = cache.get(&path).await {
         audit.log_cache_hit(&path).await;
-        return Ok(Box::new(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({"cached": true})),
-            warp::http::StatusCode::OK,
-        )));
+        return Ok(Box::new(cached.into_reply()));
     }
 
+    // Requests without a resolvable client IP cannot be attributed, so they
+    // are denied rather than allowed by default. Running without a trusted
+    // reverse proxy therefore requires one to set X-Forwarded-For or
+    // X-Real-IP, otherwise every request is rejected with 403.
     let allowed = match &client_ip {
-        Some(ip) => policy.check_request(ip, &path, &method).unwrap_or(false),
+        Some(ip) => policy
+            .check_request(ip, &path, &method)
+            .await
+            .unwrap_or(false),
         None => false,
     };
     if !allowed {
-        audit.log_request(&method, &path, &headers).await;
         return Ok(Box::new(warp::reply::with_status(
             warp::reply::json(&serde_json::json!({"error": "Access denied by policy"})),
             warp::http::StatusCode::FORBIDDEN,
@@ -252,16 +255,19 @@ async fn handle_debian_request(
     match fetcher.fetch(&path).await {
         Ok(response) => {
             audit.log_fetch_success(&path).await;
-            let path_str = path.as_str();
-            let response_bytes = extract_response_bytes(response);
-            let cached_response = warp::reply::Response::new(response_bytes.clone().into());
-            cache.store(&path, cached_response).await;
-            if path_str.ends_with("InRelease") || path_str.ends_with("Release") {
-                if let Ok(verification_result) = gpg_verifier.verify_inrelease(&response_bytes) {
-                    if verification_result.valid {
+
+            let status = response.status;
+            let body = response.body;
+
+            // Verify signatures BEFORE caching, and fail closed: an error from
+            // the verifier must not be treated as "nothing to check".
+            if path.ends_with("InRelease") || path.ends_with("Release") {
+                match gpg_verifier.verify_inrelease(&body) {
+                    Ok(verification) if verification.valid => {
                         audit.log_verification_success(&path).await;
-                    } else {
-                        let error_msg = verification_result
+                    }
+                    Ok(verification) => {
+                        let error_msg = verification
                             .error_message
                             .as_deref()
                             .unwrap_or("Unknown error");
@@ -270,21 +276,42 @@ async fn handle_debian_request(
                             warp::reply::json(
                                 &serde_json::json!({"error": "GPG verification failed"}),
                             ),
-                            warp::http::StatusCode::BAD_REQUEST,
+                            warp::http::StatusCode::BAD_GATEWAY,
+                        )));
+                    }
+                    Err(e) => {
+                        audit.log_verification_failed(&path, &e.to_string()).await;
+                        return Ok(Box::new(warp::reply::with_status(
+                            warp::reply::json(
+                                &serde_json::json!({"error": "GPG verification error"}),
+                            ),
+                            warp::http::StatusCode::BAD_GATEWAY,
                         )));
                     }
                 }
             }
 
-            let mut warp_response = warp::reply::Response::new(response_bytes.into());
-            *warp_response.status_mut() = warp::http::StatusCode::OK;
-            Ok(Box::new(warp_response))
+            // Only verified content is stored.
+            cache
+                .store(
+                    &path,
+                    CachedResponse {
+                        status,
+                        headers: response.headers,
+                        body: body.clone(),
+                    },
+                )
+                .await;
+
+            let mut reply = warp::reply::Response::new(body.into());
+            *reply.status_mut() = status;
+            Ok(Box::new(reply))
         }
         Err(e) => {
             audit.log_fetch_error(&path, &e).await;
             Ok(Box::new(warp::reply::with_status(
                 warp::reply::json(&serde_json::json!({"error": e.to_string()})),
-                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                warp::http::StatusCode::BAD_GATEWAY,
             )))
         }
     }
@@ -309,11 +336,63 @@ fn extract_client_ip(
     None
 }
 
-fn extract_response_bytes(response: impl Reply) -> Vec<u8> {
-    let resp = response.into_response();
-    let body = resp.into_body();
-    let bytes = tokio::runtime::Handle::current()
-        .block_on(hyper::body::to_bytes(body))
-        .unwrap_or_default();
-    bytes.to_vec()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn healthz_is_reachable_without_panicking() {
+        let metrics = Arc::new(MetricsCollector::new());
+        let reply = handle_health(metrics).await.expect("health handler");
+        assert_eq!(reply.into_response().status(), warp::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_renders_prometheus_text() {
+        let metrics = Arc::new(MetricsCollector::new());
+        metrics.increment_total_requests().await;
+        let reply = handle_metrics(metrics).await.expect("metrics handler");
+        assert_eq!(reply.into_response().status(), warp::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn converting_a_fetched_response_runs_inside_a_runtime() {
+        let mut headers = warp::http::HeaderMap::new();
+        headers.insert(
+            warp::http::header::CONTENT_TYPE,
+            warp::http::HeaderValue::from_static("application/octet-stream"),
+        );
+
+        let fetched = crate::mirror::fetch::FetchedResponse {
+            status: reqwest::StatusCode::PARTIAL_CONTENT,
+            headers,
+            body: bytes::Bytes::from_static(b"payload"),
+        };
+
+        let response = fetched.into_http_response();
+        assert_eq!(response.status(), warp::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get(warp::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn client_ip_precedence_prefers_forwarded_for() {
+        let mut headers = warp::http::HeaderMap::new();
+        headers.insert("x-real-ip", "10.0.0.9".parse().unwrap());
+
+        let forwarded = Some("203.0.113.7, 10.0.0.1".to_string());
+        assert_eq!(
+            extract_client_ip(&headers, &forwarded).as_deref(),
+            Some("203.0.113.7")
+        );
+        assert_eq!(
+            extract_client_ip(&headers, &None).as_deref(),
+            Some("10.0.0.9")
+        );
+    }
 }
