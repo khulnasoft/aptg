@@ -5,6 +5,7 @@ use crate::metrics::MetricsCollector;
 use crate::mirror::fetch::MirrorFetcher;
 use crate::policy::rules::PolicyEngine;
 use crate::verify::gpg::GpgVerifier;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use warp::{Filter, Rejection, Reply};
@@ -66,6 +67,7 @@ pub fn build_routes() -> impl Filter<Extract = impl Reply, Error = Rejection> + 
         .and(warp::method())
         .and(warp::header::headers_cloned())
         .and(warp::header::optional("x-forwarded-for"))
+        .and(warp::addr::remote())
         .and(with_fetcher(fetcher.clone()))
         .and(with_policy(policy.clone()))
         .and(with_cache(cache.clone()))
@@ -176,6 +178,7 @@ async fn handle_debian_request(
     method: warp::http::Method,
     headers: warp::http::HeaderMap,
     forwarded_for: Option<String>,
+    remote_addr: Option<SocketAddr>,
     fetcher: Arc<MirrorFetcher>,
     policy: Arc<PolicyEngine>,
     cache: Arc<CacheManager>,
@@ -185,7 +188,7 @@ async fn handle_debian_request(
 ) -> Result<Box<dyn Reply + Send>, Rejection> {
     let path = format!("/debian/{}", path_tail.as_str());
 
-    let client_ip = extract_client_ip(&headers, &forwarded_for);
+    let client_ip = extract_client_ip(&headers, &forwarded_for, remote_addr.as_ref());
 
     audit.log_request(&method, &path, &headers).await;
 
@@ -194,10 +197,9 @@ async fn handle_debian_request(
         return Ok(Box::new(cached.into_reply()));
     }
 
-    // Requests without a resolvable client IP cannot be attributed, so they
-    // are denied rather than allowed by default. Running without a trusted
-    // reverse proxy therefore requires one to set X-Forwarded-For or
-    // X-Real-IP, otherwise every request is rejected with 403.
+    // A request with no resolvable client IP cannot be attributed, so it is
+    // denied. With the socket peer fallback in extract_client_ip this now only
+    // happens when the transport exposes no remote address.
     let allowed = match &client_ip {
         Some(ip) => policy
             .check_request(ip, &path, &method)
@@ -317,23 +319,41 @@ async fn handle_debian_request(
     }
 }
 
+/// Resolve the client IP used for policy, rate limiting, and GeoIP lookups.
+///
+/// Precedence: `X-Forwarded-For` (left-most entry, as set by a trusted reverse
+/// proxy) > `X-Real-IP` > `X-Forwarded` > the socket peer address.
+///
+/// Note that the proxy headers are only trustworthy when a trusted proxy is the
+/// sole path to this service; a direct client can forge them. The socket peer
+/// fallback is what makes aptg usable without a reverse proxy, but it also means
+/// a direct client could spoof its identity via headers unless the deployment
+/// restricts ingress.
 fn extract_client_ip(
     headers: &warp::http::HeaderMap,
     forwarded_for: &Option<String>,
+    remote_addr: Option<&SocketAddr>,
 ) -> Option<String> {
     if let Some(forwarded) = forwarded_for {
-        return Some(forwarded.split(',').next().unwrap_or("").trim().to_string());
+        if let Some(first) = forwarded.split(',').next().map(str::trim) {
+            if !first.is_empty() {
+                return Some(first.to_string());
+            }
+        }
     }
 
-    if let Some(real_ip) = headers.get("X-Real-IP") {
-        return Some(real_ip.to_str().unwrap_or("").to_string());
+    for header in ["x-real-ip", "x-forwarded"] {
+        if let Some(value) = headers.get(header) {
+            if let Ok(text) = value.to_str() {
+                let text = text.trim();
+                if !text.is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+        }
     }
 
-    if let Some(x_forwarded) = headers.get("X-Forwarded") {
-        return Some(x_forwarded.to_str().unwrap_or("").to_string());
-    }
-
-    None
+    remote_addr.map(|addr| addr.ip().to_string())
 }
 
 #[cfg(test)]
@@ -386,13 +406,72 @@ mod tests {
         headers.insert("x-real-ip", "10.0.0.9".parse().unwrap());
 
         let forwarded = Some("203.0.113.7, 10.0.0.1".to_string());
+        let peer: SocketAddr = "198.51.100.4:5555".parse().unwrap();
         assert_eq!(
-            extract_client_ip(&headers, &forwarded).as_deref(),
+            extract_client_ip(&headers, &forwarded, Some(&peer)).as_deref(),
             Some("203.0.113.7")
         );
         assert_eq!(
-            extract_client_ip(&headers, &None).as_deref(),
+            extract_client_ip(&headers, &None, Some(&peer)).as_deref(),
             Some("10.0.0.9")
+        );
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_socket_peer() {
+        let headers = warp::http::HeaderMap::new();
+        let peer: SocketAddr = "198.51.100.4:5555".parse().unwrap();
+        assert_eq!(
+            extract_client_ip(&headers, &None, Some(&peer)).as_deref(),
+            Some("198.51.100.4")
+        );
+    }
+
+    #[test]
+    fn client_ip_ignores_empty_proxy_headers() {
+        let mut headers = warp::http::HeaderMap::new();
+        headers.insert("x-real-ip", "   ".parse().unwrap());
+        let peer: SocketAddr = "198.51.100.4:5555".parse().unwrap();
+        assert_eq!(
+            extract_client_ip(&headers, &Some("  , 10.0.0.1".to_string()), Some(&peer)).as_deref(),
+            Some("198.51.100.4")
+        );
+    }
+
+    #[test]
+    fn client_ip_is_none_only_when_nothing_resolves() {
+        let headers = warp::http::HeaderMap::new();
+        assert_eq!(extract_client_ip(&headers, &None, None), None);
+    }
+
+    /// End-to-end check that a request with no proxy headers is served using
+    /// the socket peer address. Requires network access to the upstream mirror,
+    /// so it is ignored by default: run with
+    /// `cargo test -- --ignored serving_uses_socket_peer_without_proxy_headers`.
+    #[tokio::test]
+    #[ignore = "requires network access to the upstream mirror"]
+    async fn serving_uses_socket_peer_without_proxy_headers() {
+        let routes = build_routes();
+        let resp = warp::test::request()
+            .method("GET")
+            .path("/debian/pool/main/a/apt/apt_2.6.1_amd64.deb")
+            .remote_addr("198.51.100.4:5555".parse().unwrap())
+            .reply(&routes)
+            .await;
+
+        assert_eq!(resp.status(), warp::http::StatusCode::OK);
+        // A .deb is an ar archive and starts with the "!<arch>" magic.
+        assert_eq!(&resp.body()[..8], b"!<arch>\n");
+    }
+
+    #[test]
+    fn forwarded_header_is_used_when_no_forwarded_for() {
+        let mut headers = warp::http::HeaderMap::new();
+        headers.insert("x-forwarded", "203.0.113.22".parse().unwrap());
+        let peer: SocketAddr = "198.51.100.4:5555".parse().unwrap();
+        assert_eq!(
+            extract_client_ip(&headers, &None, Some(&peer)).as_deref(),
+            Some("203.0.113.22")
         );
     }
 }
