@@ -1,7 +1,7 @@
 # aptg
 
-[![CI](https://github.com/mdselim606570-cloud/aptg/workflows/Rust%20CI/badge.svg)](https://github.com/mdselim606570-cloud/aptg/actions)
-[![Docker Build](https://github.com/mdselim606570-cloud/aptg/workflows/Docker%20Build/badge.svg)](https://github.com/mdselim606570-cloud/aptg/pkgs/container/aptg)
+[![CI](https://github.com /aptg/workflows/Rust%20CI/badge.svg)](https://github.com/khulnasoftaptg/actions)
+[![Docker Build](https://github.com/khulnasoftaptg/workflows/Docker%20Build/badge.svg)](https://github.com/khulnasoftaptg/pkgs/container/aptg)
 [![Crates.io](https://img.shields.io/crates/v/aptg.svg)](https://crates.io/crates/aptg)
 [![Rust](https://img.shields.io/badge/rust-1.88+-934488?logo=rust)](https://www.rust-lang.org)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://opensource.org/licenses/MIT)
@@ -206,6 +206,6 @@ To report a vulnerability, see [Security Policy](SECURITY.md).
 
 ## Support
 
-- [Bug Reports](https://github.com/mdselim606570-cloud/aptg/issues/new/choose)
+- [Bug Reports](https://github.com/khulnasoftaptg/issues/new/choose)
 - Check audit logs for troubleshooting
 - Review configuration documentation
