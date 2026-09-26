@@ -16,6 +16,7 @@ min_tls_version = "1.2"
 
 [upstream]
 base_url = "https://deb.debian.org"
+suite = "bookworm"
 timeout_seconds = 30
 verify_ssl = true
 ca_cert_path = "certs/upstream-ca.pem"

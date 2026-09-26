@@ -1,10 +1,12 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use reqwest::{header::HeaderMap, Client, Response, StatusCode};
+use std::io::Read;
 use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
 use warp::http::Response as HttpResponse;
 use warp::hyper::Body;
+use xz2::read::XzDecoder;
 
 use crate::verify::hashes::HashVerifier;
 
@@ -319,29 +321,37 @@ impl MirrorFetcher {
         Err(last_error.unwrap_or_else(|| anyhow!("All upstreams failed for {}", path)))
     }
 
-    pub async fn fetch_with_hash_validation(&self, path: &str) -> Result<FetchedResponse> {
+    pub async fn fetch_with_hash_validation(
+        &self,
+        path: &str,
+        suite: &str,
+    ) -> Result<FetchedResponse> {
         let file_name = self.get_file_name(path);
-        let release_path = path.replace(file_name.as_str(), "Release");
+        let component = self.extract_component(path);
+        let arch = self.extract_arch(&file_name);
+        let packages_path = format!("/debian/dists/{suite}/{component}/binary-{arch}/Packages.xz");
 
         info!(
             "Fetching with hash validation for path: {}, file_name: {}",
             path, file_name
         );
 
-        let release_bytes = match self.fetch_release(release_path.as_str()).await {
+        let packages_compressed = match self.fetch_release(&packages_path).await {
             Ok(b) => b,
             Err(e) => {
                 return Err(anyhow!(
-                    "Failed to fetch Release file for hash validation: {}",
+                    "Failed to fetch Packages file for hash validation: {}",
                     e
                 ));
             }
         };
 
-        let release_content = String::from_utf8(release_bytes.clone())
-            .map_err(|e| anyhow!("Release file is not valid UTF-8: {}", e))?;
+        let packages_content = String::from_utf8(Self::decompress_xz(&packages_compressed)?)
+            .map_err(|e| anyhow!("Packages file is not valid UTF-8: {}", e))?;
 
-        let release_hashes = HashVerifier::parse_release_hashes(&release_content)?;
+        let expected_hash = self
+            .find_hash_in_packages(&packages_content, &file_name)
+            .ok_or_else(|| anyhow!("No hash found for {} in Packages", file_name))?;
 
         let _timeout = self.get_timeout_for_path(path);
         let _max_size = self.get_max_size_for_path(path);
@@ -386,9 +396,7 @@ impl MirrorFetcher {
                 continue;
             }
 
-            if let Err(e) =
-                HashVerifier::verify_file_against_release(&bytes, &file_name, &release_hashes)
-            {
+            if let Err(e) = HashVerifier::verify_package_hash(&bytes, &expected_hash) {
                 warn!("Hash validation failed for {}: {}", file_name, e);
                 last_error = Some(e);
                 continue;
@@ -409,6 +417,54 @@ impl MirrorFetcher {
                 path
             )
         }))
+    }
+
+    fn extract_component(&self, path: &str) -> String {
+        let after_pool = path.strip_prefix("/debian/pool/").unwrap_or(path);
+        after_pool.split('/').next().unwrap_or("main").to_string()
+    }
+
+    fn extract_arch(&self, file_name: &str) -> String {
+        if let Some(idx) = file_name.rfind('_') {
+            let after = &file_name[idx + 1..];
+            if let Some(dot) = after.find('.') {
+                let arch = &after[..dot];
+                if arch.ends_with("amd64") || arch.ends_with("arm64") || arch.ends_with("all") {
+                    return arch.to_string();
+                }
+            }
+        }
+        "amd64".to_string()
+    }
+
+    fn find_hash_in_packages(&self, content: &str, file_name: &str) -> Option<String> {
+        let mut current_filename: Option<String> = None;
+        let mut current_hash: Option<String> = None;
+
+        for line in content.lines() {
+            if line.is_empty() {
+                if current_filename.as_deref().map(|f| f.rsplit('/').next())
+                    == Some(Some(file_name))
+                {
+                    return current_hash;
+                }
+                current_filename = None;
+                current_hash = None;
+                continue;
+            }
+
+            if let Some(val) = line.strip_prefix("Filename: ") {
+                current_filename = Some(val.trim().to_string());
+            } else if let Some(val) = line.strip_prefix("SHA256: ") {
+                current_hash = Some(val.trim().to_string());
+            }
+        }
+
+        if current_filename.as_deref().map(|f| f.rsplit('/').next()) == Some(Some(file_name)) {
+            current_hash
+        } else {
+            None
+        }
     }
 
     async fn fetch_release(&self, release_path: &str) -> Result<Vec<u8>> {
@@ -443,6 +499,13 @@ impl MirrorFetcher {
         }
 
         Err(last_error.unwrap_or_else(|| anyhow!("Failed to fetch Release file")))
+    }
+
+    fn decompress_xz(data: &[u8]) -> Result<Vec<u8>> {
+        let mut decoder = XzDecoder::new(data);
+        let mut decompressed = Vec::with_capacity(data.len() * 10);
+        decoder.read_to_end(&mut decompressed)?;
+        Ok(decompressed)
     }
 
     pub fn set_current_upstream(&mut self, index: usize) {

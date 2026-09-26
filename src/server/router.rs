@@ -53,14 +53,24 @@ fn with_metrics<T: Clone + Send + Sync>(
     warp::any().map(move || item.clone())
 }
 
+fn with_suite(
+    suite: String,
+) -> impl Filter<Extract = (String,), Error = std::convert::Infallible> + Clone {
+    warp::any().map(move || suite.clone())
+}
+
 pub async fn build_routes(
-    cfg: Arc<tokio::sync::RwLock<config::AppConfig>>,
+    app_config: Arc<tokio::sync::RwLock<config::AppConfig>>,
 ) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
-    let cfg_init = cfg.read().await;
-    let fetcher = Arc::new(MirrorFetcher::new(vec![cfg_init.upstream.base_url.clone()]));
-    let audit = Arc::new(AuditLogger::with_log_file(&cfg_init.audit.log_file));
-    let gpg_verifier = Arc::new(GpgVerifier::new(&cfg_init.verification.gpg_keyring_path));
-    drop(cfg_init);
+    let config_init = app_config.read().await;
+    let suite = config_init.upstream.suite.clone();
+    let fetcher = Arc::new(MirrorFetcher::new(vec![config_init
+        .upstream
+        .base_url
+        .clone()]));
+    let audit = Arc::new(AuditLogger::with_log_file(&config_init.audit.log_file));
+    let gpg_verifier = Arc::new(GpgVerifier::new(&config_init.verification.gpg_keyring_path));
+    drop(config_init);
     let policy = Arc::new(PolicyEngine::new());
     let cache = Arc::new(CacheManager::new());
     let geo_policy = GeoPolicy::default();
@@ -73,6 +83,7 @@ pub async fn build_routes(
         .and(warp::header::headers_cloned())
         .and(warp::header::optional("x-forwarded-for"))
         .and(warp::addr::remote())
+        .and(with_suite(suite))
         .and(with_fetcher(fetcher.clone()))
         .and(with_policy(policy.clone()))
         .and(with_cache(cache.clone()))
@@ -184,6 +195,7 @@ async fn handle_debian_request(
     headers: warp::http::HeaderMap,
     forwarded_for: Option<String>,
     remote_addr: Option<SocketAddr>,
+    suite: String,
     fetcher: Arc<MirrorFetcher>,
     policy: Arc<PolicyEngine>,
     cache: Arc<CacheManager>,
@@ -259,7 +271,13 @@ async fn handle_debian_request(
         }
     }
 
-    match fetcher.fetch(&path).await {
+    let response = if path.ends_with(".deb") {
+        fetcher.fetch_with_hash_validation(&path, &suite).await
+    } else {
+        fetcher.fetch(&path).await
+    };
+
+    match response {
         Ok(response) => {
             audit.log_fetch_success(&path).await;
 
@@ -456,7 +474,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires network access to the upstream mirror"]
     async fn serving_uses_socket_peer_without_proxy_headers() {
-        let cfg = Arc::new(tokio::sync::RwLock::new(config::AppConfig {
+        let app_config = Arc::new(tokio::sync::RwLock::new(config::AppConfig {
             server: config::ServerConfig {
                 host: "0.0.0.0".into(),
                 port: 8080,
@@ -472,6 +490,7 @@ mod tests {
             },
             upstream: config::UpstreamConfig {
                 base_url: "https://deb.debian.org".into(),
+                suite: "bookworm".into(),
                 timeout_seconds: 30,
                 verify_ssl: true,
                 ca_cert_path: "upstream-ca.pem".into(),
@@ -495,7 +514,7 @@ mod tests {
             },
             policy: crate::policy::rules::PolicyConfig::default(),
         }));
-        let routes = build_routes(cfg).await;
+        let routes = build_routes(app_config).await;
         let resp = warp::test::request()
             .method("GET")
             .path("/debian/pool/main/a/apt/apt_2.6.1_amd64.deb")

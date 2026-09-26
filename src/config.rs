@@ -28,6 +28,7 @@ pub struct TlsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UpstreamConfig {
     pub base_url: String,
+    pub suite: String,
     pub timeout_seconds: u64,
     pub verify_ssl: bool,
     pub ca_cert_path: String,
@@ -162,6 +163,7 @@ min_tls_version = "1.3"
 
 [upstream]
 base_url = "https://example.com"
+suite = "bookworm"
 timeout_seconds = 60
 verify_ssl = false
 ca_cert_path = "upstream-ca.pem"
