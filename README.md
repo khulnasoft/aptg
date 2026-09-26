@@ -1,48 +1,78 @@
 # aptg
 
-A secure, Rust-based Debian mirror redirector (aptg) with verification, caching, and policy enforcement.
+[![CI](https://github.com/mdselim606570-cloud/aptg/workflows/Rust%20CI/badge.svg)](https://github.com/mdselim606570-cloud/aptg/actions)
+[![Docker Build](https://github.com/mdselim606570-cloud/aptg/workflows/Docker%20Build/badge.svg)](https://github.com/mdselim606570-cloud/aptg/pkgs/container/aptg)
+[![Crates.io](https://img.shields.io/crates/v/aptg.svg)](https://crates.io/crates/aptg)
+[![Rust](https://img.shields.io/badge/rust-1.88+-934488?logo=rust)](https://www.rust-lang.org)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://opensource.org/licenses/MIT)
+
+A secure, Rust-based Debian mirror redirector with GPG verification, hash validation, smart caching, and policy enforcement.
+
+## Architecture
+
+```
+┌─────────────┐      ┌──────────────────────────────────────────────────┐      ┌──────────────────┐
+│  APT Client  │─────▶│                    aptg                          │─────▶│  Upstream Mirror  │
+│  (apt-get)   │      │                                                │      │  (deb.debian.org)│
+└─────────────┘      │  ┌──────────┐  ┌──────────┐  ┌──────────────┐  │      └──────────────────┘
+                     │  │   GPG    │  │   SHA256 │  │    Cache     │  │              │
+                     │  │Verify    │  │ Validate │  │  (FS/local)  │  │              ▼
+                     │  └──────────┘  └──────────┘  └──────────────┘  │      ┌──────────┐
+                     │         │                │          │          │      │ Debian   │
+                     │         ▼                ▼          ▼          │      │ Package  │
+                     │  ┌──────────┐  ┌──────────┐  ┌──────────────┐  │      │ .deb     │
+                     │  │  Policy  │  │  Audit   │  │   Banlist    │  │      │  Cache   │
+                     │  │  Engine  │  │  Logger  │  │  (persist)   │  │      └──────────┘
+                     │  └──────────┘  └──────────┘  └──────────────┘  │
+                     └──────────────────────────────────────────────────┘
+```
+
+### Request Flow
+
+```
+APT Client → aptg:8080 → Client IP Resolution (X-Forwarded-For / socket peer)
+                            │
+                            ├── PolicyEngine::check_request(ip, path, method)
+                            │     ├── Banlist check (persistent)
+                            │     ├── Rate limiter (per-client burst + per-minute)
+                            │     └── Suite / component / architecture whitelist
+                            │
+                            ├── CacheManager::get(path) → hit? return cached
+                            │
+                            ├── MirrorFetcher::fetch_with_hash_validation(path, suite)
+                            │     ├── Packages.xz cache (1h TTL)
+                            │     ├── Find SHA256 for .deb in Packages file
+                            │     ├── Fetch .deb from upstream
+                            │     └── Verify SHA256 hash
+                            │
+                            ├── GpgVerifier::verify (if enabled)
+                            │     └── Parse --status-fd 2 machine output
+                            │
+                            └── AuditLogger::log_request (JSON lines, rotation)
+```
 
 ## Features
 
 - **Secure Reverse Proxy**: Fetches, verifies, and caches Debian packages
 - **GPG Verification**: Verifies Debian package signatures using official keys
-- **Hash Validation**: Validates package integrity using SHA256 hashes
+- **Hash Validation**: Validates package integrity using SHA256 hashes from `Packages.xz`
 - **Smart Caching**: Different TTLs for different file types
-- **Policy Engine**: Access control based on suites, components, and architectures
-- **Audit Logging**: Complete audit trail of all requests and actions
+- **Policy Engine**: Access control based on suites, components, architectures
+- **Audit Logging**: Complete audit trail of all requests (JSON lines, rotation)
 - **APT Compatible**: Works seamlessly with APT package manager
-
-## Architecture
-
-```
-APT Client
-   |
-   v
-Rust aptg
-   ├── GPG Verification
-   ├── Hash Validation (SHA256)
-   ├── Cache (FS / Object storage)
-   ├── Policy Engine
-   └── Audit Logs
-   |
-   v
-Upstream Debian Mirror
-```
+- **Banlist Persistence**: Banned IPs survive restarts via `banlist.json`
+- **Hot Reload**: Config and policy reload without restart (5s poll)
 
 ## Quick Start
 
 1. **Build and run**:
    ```bash
-   cargo run
+   cargo run -- --config config.toml
    ```
 
 2. **Configure APT**:
    ```bash
    echo "deb https://localhost:8080/debian bookworm main" | sudo tee /etc/apt/sources.list.d/mirror.list
-   ```
-
-3. **Update package lists**:
-   ```bash
    sudo apt update
    ```
 
@@ -65,7 +95,7 @@ Edit `config.toml` to customize:
 - Uses official Debian archive keys
 
 ### Hash Validation
-- Validates SHA256 hashes from Release files
+- Validates SHA256 hashes from `Packages.xz`
 - Ensures package integrity
 - Prevents tampering
 
@@ -111,8 +141,6 @@ architectures = ["i386", "armhf"]
 
 ## Monitoring
 
-The service provides comprehensive logging:
-
 ```bash
 # View audit logs
 tail -f /var/log/aptg.log
@@ -126,7 +154,13 @@ grep "Policy violation" /var/log/aptg.log
 
 ## Production Deployment
 
-### Systemd Service
+### Docker
+```bash
+docker build -t aptg .
+docker run -p 8080:8080 -v $(pwd)/config.toml:/etc/aptg/config.toml aptg --config /etc/aptg/config.toml
+```
+
+### Systemd
 ```ini
 [Unit]
 Description=aptg - Debian Mirror Redirector
@@ -134,104 +168,44 @@ After=network.target
 
 [Service]
 Type=simple
-User=mirror
-WorkingDirectory=/opt/aptg
-ExecStart=/opt/aptg/target/release/aptg
+User=aptg
+WorkingDirectory=/var/lib/aptg
+ExecStart=/usr/local/bin/aptg --config /etc/aptg/config.toml
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### Nginx Reverse Proxy
-```nginx
-server {
-    listen 443 ssl;
-    server_name mirror.example.com;
-    
-    location /debian/ {
-        proxy_pass http://localhost:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
-```
-
-## Security Considerations
-
-1. **Key Management**: Keep Debian archive keys secure
-2. **Network Isolation**: Run in isolated network segment
-3. **Resource Limits**: Set appropriate memory and CPU limits
-4. **Access Control**: Use firewall rules to restrict access
-5. **Regular Updates**: Keep the service and keys updated
-
-## Development
-
-### Build
-```bash
-cargo build --release
-```
-
-### Test
-```bash
-cargo test
-```
-
-### Run with GPG verification
-```bash
-cargo run --features gpg-verify
-```
-
-### Build with Docker
-```bash
-docker build -t aptg .
-```
-
-### Run with Docker Compose
-```bash
-docker-compose up -d
-```
-
 ## CI/CD
 
-This project uses GitHub Actions for Continuous Integration:
-- **Check**: Validates that the code compiles.
-- **Test**: Runs the unit test suite.
-- **Format**: Ensures code style consistency.
-- **Clippy**: Performs static analysis to catch common mistakes.
-- **Docker**: Validates the Docker build on pushes to `main`.
+- **Rust CI**: Check, test, format, clippy on every push/PR
+- **Docker Build**: Multi-platform (`linux/amd64`, `linux/arm64`) build and push to `ghcr.io` on `main` and version tags
+- **Release**: Cross-platform binaries (Linux amd64/arm64, macOS Intel/ARM) attached to GitHub Releases
 
 ## Releases
 
-To create a new release with cross-platform binaries:
-1. Update version in `Cargo.toml`.
-2. Create and push a new tag:
-   ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
-   ```
-The Release workflow will automatically build binaries for Linux (amd64, arm64) and macOS (Intel, Apple Silicon) and attach them to a new GitHub Release.
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow builds cross-platform binaries and creates a GitHub Release automatically.
 
 ## License
 
-This project is dual-licensed under the MIT and Apache 2.0 licenses.
-- [MIT License](LICENSE-MIT)
-- [Apache License 2.0](LICENSE-APACHE)
-
-Users can choose either license based on their requirements.
+Dual-licensed under MIT or Apache 2.0.
 
 ## Contributing
 
-Contributions are welcome! Please read our [CONTRIBUTING.md](CONTRIBUTING.md) and [Code of Conduct](CODE_OF_CONDUCT.md) before submitting a Pull Request.
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) and [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Security
 
-To report a security vulnerability, please see our [Security Policy](SECURITY.md).
+To report a vulnerability, see [Security Policy](SECURITY.md).
 
 ## Support
 
-For issues and questions:
-- Open a [Bug Report or Feature Request](https://github.com/khulnasoft/mirror/issues/new/choose)
-- Create an issue on GitHub
-- Check the audit logs for troubleshooting
-- Review the configuration documentation
+- [Bug Reports](https://github.com/mdselim606570-cloud/aptg/issues/new/choose)
+- Check audit logs for troubleshooting
+- Review configuration documentation
