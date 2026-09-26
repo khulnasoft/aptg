@@ -1,5 +1,6 @@
 use crate::audit::log::AuditLogger;
 use crate::cache::cache::{CacheManager, CachedResponse};
+use crate::config;
 use crate::geoip::policy::{GeoPolicy, GeoPolicyEngine};
 use crate::metrics::MetricsCollector;
 use crate::mirror::fetch::MirrorFetcher;
@@ -52,12 +53,16 @@ fn with_metrics<T: Clone + Send + Sync>(
     warp::any().map(move || item.clone())
 }
 
-pub fn build_routes() -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
-    let fetcher = Arc::new(MirrorFetcher::new_with_default());
+pub async fn build_routes(
+    cfg: Arc<tokio::sync::RwLock<config::AppConfig>>,
+) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
+    let cfg_init = cfg.read().await;
+    let fetcher = Arc::new(MirrorFetcher::new(vec![cfg_init.upstream.base_url.clone()]));
+    let audit = Arc::new(AuditLogger::with_log_file(&cfg_init.audit.log_file));
+    let gpg_verifier = Arc::new(GpgVerifier::new(&cfg_init.verification.gpg_keyring_path));
+    drop(cfg_init);
     let policy = Arc::new(PolicyEngine::new());
     let cache = Arc::new(CacheManager::new());
-    let audit = Arc::new(AuditLogger::new());
-    let gpg_verifier = Arc::new(GpgVerifier::new("/etc/debian-archive-keyring.gpg"));
     let geo_policy = GeoPolicy::default();
     let geo_policy_engine = Arc::new(GeoPolicyEngine::new(geo_policy));
     let metrics = Arc::new(MetricsCollector::new());
@@ -451,7 +456,46 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires network access to the upstream mirror"]
     async fn serving_uses_socket_peer_without_proxy_headers() {
-        let routes = build_routes();
+        let cfg = Arc::new(tokio::sync::RwLock::new(config::AppConfig {
+            server: config::ServerConfig {
+                host: "0.0.0.0".into(),
+                port: 8080,
+                https_port: 8443,
+                enable_https: false,
+            },
+            tls: config::TlsConfig {
+                cert_path: "c.pem".into(),
+                key_path: "k.pem".into(),
+                ca_path: "ca.pem".into(),
+                client_auth_required: false,
+                min_tls_version: "1.2".into(),
+            },
+            upstream: config::UpstreamConfig {
+                base_url: "https://deb.debian.org".into(),
+                timeout_seconds: 30,
+                verify_ssl: true,
+                ca_cert_path: "upstream-ca.pem".into(),
+            },
+            cache: config::CacheConfig {
+                release_ttl: 21600,
+                packages_ttl: 43200,
+                deb_ttl: 31536000,
+            },
+            audit: config::AuditConfig {
+                log_level: "info".into(),
+                log_file: std::env::temp_dir()
+                    .join("aptg-test-audit.log")
+                    .to_string_lossy()
+                    .into(),
+            },
+            verification: config::VerificationConfig {
+                gpg_keyring_path: "/etc/debian-archive-keyring.gpg".into(),
+                enable_gpg_verification: true,
+                enable_hash_verification: true,
+            },
+            policy: crate::policy::rules::PolicyConfig::default(),
+        }));
+        let routes = build_routes(cfg).await;
         let resp = warp::test::request()
             .method("GET")
             .path("/debian/pool/main/a/apt/apt_2.6.1_amd64.deb")

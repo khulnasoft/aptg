@@ -37,7 +37,9 @@ packages = []
 
 [policy.limits]
 max_deb_size_mb = 500
-max_request_rate_per_minute = 100
+max_requests_per_minute_per_ip = 100
+burst_size = 20
+ban_duration_seconds = 300
 
 [audit]
 log_level = "info"

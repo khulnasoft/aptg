@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod cache;
+pub mod config;
 pub mod geoip;
 pub mod metrics;
 pub mod mirror;
