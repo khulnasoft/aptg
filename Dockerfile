@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.79-slim AS builder
+FROM rust:1.88-slim AS builder
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends pkg-config libssl-dev && \
