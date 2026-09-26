@@ -1,8 +1,11 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use reqwest::{header::HeaderMap, Client, Response, StatusCode};
+use std::collections::HashMap;
 use std::io::Read;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 use warp::http::Response as HttpResponse;
 use warp::hyper::Body;
@@ -43,10 +46,55 @@ impl FetchedResponse {
     }
 }
 
+/// Cached parsed contents of a Packages file.
+///
+/// Refreshed automatically when the entry ages past `ttl`.
+struct PackagesCacheEntry {
+    hashes: HashMap<String, String>,
+    fetched_at: SystemTime,
+}
+
+pub struct PackagesCache {
+    entries: Arc<RwLock<HashMap<String, PackagesCacheEntry>>>,
+    ttl: Duration,
+}
+
+impl PackagesCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            ttl,
+        }
+    }
+
+    pub async fn get(&self, key: &str) -> Option<HashMap<String, String>> {
+        let entries = self.entries.read().await;
+        entries.get(key).and_then(|e| {
+            if e.fetched_at.elapsed().unwrap_or(Duration::ZERO) < self.ttl {
+                Some(e.hashes.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub async fn insert(&self, key: String, hashes: HashMap<String, String>) {
+        let mut entries = self.entries.write().await;
+        entries.insert(
+            key,
+            PackagesCacheEntry {
+                hashes,
+                fetched_at: SystemTime::now(),
+            },
+        );
+    }
+}
+
 pub struct MirrorFetcher {
     client: Client,
     upstream_urls: Vec<String>,
     current_index: usize,
+    packages_cache: Arc<PackagesCache>,
 }
 
 impl MirrorFetcher {
@@ -67,6 +115,7 @@ impl MirrorFetcher {
             client,
             upstream_urls: urls,
             current_index: 0,
+            packages_cache: Arc::new(PackagesCache::new(Duration::from_secs(3600))),
         }
     }
 
@@ -336,21 +385,33 @@ impl MirrorFetcher {
             path, file_name
         );
 
-        let packages_compressed = match self.fetch_release(&packages_path).await {
-            Ok(b) => b,
-            Err(e) => {
-                return Err(anyhow!(
-                    "Failed to fetch Packages file for hash validation: {}",
-                    e
-                ));
+        let cache_key = format!("{suite}/{component}/binary-{arch}/Packages");
+        let hashes = match self.packages_cache.get(&cache_key).await {
+            Some(h) => {
+                info!("Using cached Packages hashes for {}", cache_key);
+                h
+            }
+            None => {
+                let packages_compressed = match self.fetch_release(&packages_path).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "Failed to fetch Packages file for hash validation: {}",
+                            e
+                        ));
+                    }
+                };
+                let packages_content =
+                    String::from_utf8(Self::decompress_xz(&packages_compressed)?)
+                        .map_err(|e| anyhow!("Packages file is not valid UTF-8: {}", e))?;
+                let hashes = self.find_all_hashes_in_packages(&packages_content);
+                self.packages_cache.insert(cache_key, hashes.clone()).await;
+                hashes
             }
         };
 
-        let packages_content = String::from_utf8(Self::decompress_xz(&packages_compressed)?)
-            .map_err(|e| anyhow!("Packages file is not valid UTF-8: {}", e))?;
-
-        let expected_hash = self
-            .find_hash_in_packages(&packages_content, &file_name)
+        let expected_hash = hashes
+            .get(file_name.as_str())
             .ok_or_else(|| anyhow!("No hash found for {} in Packages", file_name))?;
 
         let _timeout = self.get_timeout_for_path(path);
@@ -396,7 +457,7 @@ impl MirrorFetcher {
                 continue;
             }
 
-            if let Err(e) = HashVerifier::verify_package_hash(&bytes, &expected_hash) {
+            if let Err(e) = HashVerifier::verify_package_hash(&bytes, expected_hash) {
                 warn!("Hash validation failed for {}: {}", file_name, e);
                 last_error = Some(e);
                 continue;
@@ -437,16 +498,15 @@ impl MirrorFetcher {
         "amd64".to_string()
     }
 
-    fn find_hash_in_packages(&self, content: &str, file_name: &str) -> Option<String> {
+    fn find_all_hashes_in_packages(&self, content: &str) -> HashMap<String, String> {
+        let mut hashes = HashMap::new();
         let mut current_filename: Option<String> = None;
         let mut current_hash: Option<String> = None;
 
         for line in content.lines() {
             if line.is_empty() {
-                if current_filename.as_deref().map(|f| f.rsplit('/').next())
-                    == Some(Some(file_name))
-                {
-                    return current_hash;
+                if let (Some(fn_), Some(h)) = (&current_filename, &current_hash) {
+                    hashes.insert(fn_.clone(), h.clone());
                 }
                 current_filename = None;
                 current_hash = None;
@@ -454,17 +514,16 @@ impl MirrorFetcher {
             }
 
             if let Some(val) = line.strip_prefix("Filename: ") {
-                current_filename = Some(val.trim().to_string());
+                let basename = val.trim().rsplit('/').next().unwrap_or("").to_string();
+                current_filename = Some(basename);
             } else if let Some(val) = line.strip_prefix("SHA256: ") {
                 current_hash = Some(val.trim().to_string());
             }
         }
-
-        if current_filename.as_deref().map(|f| f.rsplit('/').next()) == Some(Some(file_name)) {
-            current_hash
-        } else {
-            None
+        if let (Some(fn_), Some(h)) = (&current_filename, &current_hash) {
+            hashes.insert(fn_.clone(), h.clone());
         }
+        hashes
     }
 
     async fn fetch_release(&self, release_path: &str) -> Result<Vec<u8>> {
